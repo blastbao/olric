@@ -80,7 +80,6 @@ func getBindIP(ifname, address string) (string, error) {
 		if len(addrs) == 0 {
 			return "", fmt.Errorf("interface '%s' has no addresses", ifname)
 		}
-		fmt.Println(addrs, iface)
 
 		// If there is no bind IP, pick an address
 		if bindIP == "0.0.0.0" {
@@ -122,12 +121,8 @@ func getBindIP(ifname, address string) (string, error) {
 	return bindIP, nil
 }
 
-func (c *Config) SetupNetworkConfig() error {
-	if c == nil {
-		return fmt.Errorf("invalid configuration")
-	}
-
-	var err error
+// SetupNetworkConfig tries to find an appropriate bindIP to bind and propagate.
+func (c *Config) SetupNetworkConfig() (err error) {
 	address := net.JoinHostPort(c.BindAddr, strconv.Itoa(c.BindPort))
 	c.BindAddr, err = getBindIP(c.Interface, address)
 	if err != nil {

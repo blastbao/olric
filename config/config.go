@@ -190,12 +190,6 @@ type Config struct {
 	// Default LogLevel is DEBUG. Valid ones: "DEBUG", "WARN", "ERROR", "INFO"
 	LogLevel string
 
-	// Name of this node in the cluster. This must be unique in the cluster. If this is not set,
-	// Olric will set it to the hostname of the running machine. Example: node1.my-cluster.net
-	//
-	// Name is also used by the TCP server as Addr. It should be an IP address or domain name of the server.
-	Name string
-
 	// BindAddr denotes the address that Olric will bind to for communication with other Olric nodes.
 	BindAddr string
 
@@ -422,23 +416,6 @@ func (c *Config) Sanitize() error {
 	// control in server initialization stage.
 	if c.BindPort == 0 {
 		c.BindPort = DefaultPort
-	}
-
-	// TODO: Config.Name is deprecated and it will be removed in v0.3.0
-	if c.Name == "" {
-		c.Name = c.BindAddr + ":" + strconv.Itoa(c.BindPort)
-	} else {
-		c.Logger.Printf("[WARN] Config.Name is deprecated. Please use BindAddr and BindPort instead of Config.name")
-		host, _port, err := net.SplitHostPort(c.Name)
-		if err != nil {
-			return err
-		}
-		port, err := strconv.Atoi(_port)
-		if err != nil {
-			return err
-		}
-		c.BindAddr = host
-		c.BindPort = port
 	}
 
 	if c.LoadFactor == 0 {
