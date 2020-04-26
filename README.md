@@ -823,16 +823,14 @@ c := config.New("local")
 ```
 
 The `New` function takes a parameter called `env`. It denotes the network environment and consumed by [hashicorp/memberlist](https://github.com/hashicorp/memberlist). 
-The returned configuration is good enough for distributed caching scenario. In order to see all configuration parameters, please
-take a look at [this](https://godoc.org/github.com/buraksezer/olric/config).
+Default configuration is good enough for distributed caching scenario. In order to see all configuration parameters, please take a look at [this](https://godoc.org/github.com/buraksezer/olric/config).
 
 See [Sample Code](#sample-code) section for an introduction.
 
 ### Client-Server Mode
 
-Olric provides `olricd` to implement client-server mode. `olricd` takes a YAML file for the configuration. The most basic 
-functionality of `olricd` is that translating YAML configuration into Olric's configuration struct. A sample `olricd.yaml` file 
-is being provided [here](https://github.com/buraksezer/olric/blob/master/cmd/olricd/olricd.yaml).
+Olric provides **olricd** to implement client-server mode. olricd gets a YAML file for the configuration. The most basic  functionality of olricd is that 
+translating YAML configuration into Olric's configuration struct. A sample `olricd.yaml` file  is being provided [here](https://github.com/buraksezer/olric/blob/master/cmd/olricd/olricd.yaml).
 
 ### Network Configuration
 
@@ -842,9 +840,9 @@ critical to deploy a healthy Olric node. There are different scenarios:
 * You can freely set a domain name or IP address as `BindAddr` for both Olric and memberlist. Olric will resolve and use it to bind.
 * You can freely set `localhost`, `127.0.0.1` or `::1` as `BindAddr` in development environment for both Olric and memberlist.
 * You can freely set `0.0.0.0` as `BindAddr` for both Olric and memberlist. Olric will pick an IP address, if there is any.
-* If you don't set `BindAddr`, hostname will be used and it will be resolved to get a valid IP address.
-* You can set a network interface by using `Config.Interface` and `Config.MemberlistInterface`. Olric will find an appropriate IP address for the given interfaces, if there is any.
-* You can set both `BindAddr` and `Config.Interface` or `Config.MemberlistInterface` parameters. In this case Olric will ensure that `BindAddr` is available on the given interface.
+* If you don't set `BindAddr`, hostname will be used, and it will be resolved to get a valid IP address.
+* You can set a network interface by using `Config.Interface` and `Config.MemberlistInterface` fields. Olric will find an appropriate IP address for the given interfaces, if there is any.
+* You can set both `BindAddr` and interface parameters. In this case Olric will ensure that `BindAddr` is available on the given interface.
 
 You should know that Olric needs a single and stable IP address to function properly. If you don't know the IP address of the host at the deployment time, 
 you can set `BindAddr` as `0.0.0.0`. Olric will very likely to find an IP address for you.
