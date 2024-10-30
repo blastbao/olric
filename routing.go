@@ -225,14 +225,21 @@ func (db *Olric) distributePrimaryCopies(partID uint64) []discovery.Member {
 	return append(owners, newOwner.(discovery.Member))
 }
 
+// 生成新路由表，该路由表包含集群中所有分区及其对应的主副本和备份副本的分布信息。
+// 这个函数遍历所有分区，并为每个分区分配主副本和备份副本。
 func (db *Olric) distributePartitions() routingTable {
 	table := make(routingTable)
+	// 分区数由 db.config.PartitionCount 决定
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {
+		// 获取当前分区 ID 对应的路由表项 item
 		item := table[partID]
+		// 为当前分区分配主副本
 		item.Owners = db.distributePrimaryCopies(partID)
-		if db.config.ReplicaCount > config.MinimumReplicaCount {
+		// 为当前分区分配备份副本
+		if db.config.ReplicaCount > config.MinimumReplicaCount { // 备份副本数
 			item.Backups = db.distributeBackups(partID)
 		}
+		// 更新路由表项 item
 		table[partID] = item
 	}
 	return table
@@ -288,12 +295,14 @@ func (db *Olric) updateRoutingTableOnCluster(table routingTable) (map[discovery.
 
 func (db *Olric) updateRouting() {
 	// This function is only run by the cluster coordinator.
+	// 检查当前节点是否为集群的协调员，更新路由表只能由 coordinator 负责。
 	if !db.discovery.IsCoordinator() {
 		return
 	}
 
 	// This type of quorum function determines the presence of quorum based on the count of members in the cluster,
 	// as observed by the local member’s cluster membership manager
+	// 检查集群节点数量是否满足 Quorum 要求
 	nr := atomic.LoadInt32(&db.numMembers)
 	if db.config.MemberCountQuorum > nr {
 		db.log.V(2).Printf("[ERROR] Impossible to calculate and update routing table: %v", ErrClusterQuorum)
@@ -302,15 +311,20 @@ func (db *Olric) updateRouting() {
 
 	// This function is called by listenMemberlistEvents and updateRoutingPeriodically
 	// So this lock prevents parallel execution.
+	// 路由更新操作无法并行
 	routingMtx.Lock()
 	defer routingMtx.Unlock()
 
+	// 计算每个分区的主副本和备份副本的所有者，生成最新路由表
 	table := db.distributePartitions()
+	// 将新路由表分发到集群中的所有节点
 	reports, err := db.updateRoutingTableOnCluster(table)
 	if err != nil {
 		db.log.V(2).Printf("[ERROR] Failed to update routing table on cluster: %v", err)
 	}
+	// 从集群节点收集到的所有权报告。这一步确保每个节点上的数据分区和备份副本的所有权信息是最新的
 	db.processOwnershipReports(reports)
+
 }
 
 func (db *Olric) processOwnershipReports(reports map[discovery.Member]ownershipReport) {
@@ -353,23 +367,32 @@ func (db *Olric) processOwnershipReports(reports map[discovery.Member]ownershipR
 	}
 }
 
+// 根据 ml 事件更新 db.members, db.consistent 和 db.numMembers 。
 func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 	db.members.mtx.Lock()
 	defer db.members.mtx.Unlock()
 
+	// 解析 node meta
 	member, _ := db.discovery.DecodeNodeMeta(event.NodeMeta)
+
+	// 节点加入：
+	//	- 将新节点添加到成员列表中 db.members.m 。
+	//	- 将新节点添加到一致性哈希环 db.consistent 中。
 	if event.Event == memberlist.NodeJoin {
 		db.members.m[member.ID] = member
 		db.consistent.Add(member)
 		db.log.V(2).Printf("[INFO] Node joined: %s", member)
 	} else if event.Event == memberlist.NodeLeave {
+		// 节点离开：
+		//	- 检查节点是否在成员列表中，如果存在则删除。
+		//	- 从一致性哈希环中移除该节点。
+		//	- 关闭与该节点相关的连接池，避免再次使用已关闭的套接字。
 		if _, ok := db.members.m[member.ID]; ok {
 			delete(db.members.m, member.ID)
 		} else {
 			db.log.V(2).Printf("[ERROR] Unknown node left: %s", event.NodeName)
 			return
 		}
-
 		db.consistent.Remove(event.NodeName)
 		// Don't try to used closed sockets again.
 		db.client.ClosePool(event.NodeName)
@@ -381,9 +404,12 @@ func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 
 	// Store the current number of members in the member list.
 	// We need this to implement a simple split-brain protection algorithm.
+	//
+	// 更新节点数目
 	db.storeNumMembers()
 }
 
+// 监听 ml 事件，执行对应逻辑
 func (db *Olric) listenMemberlistEvents(eventCh chan *discovery.ClusterEvent) {
 	defer db.wg.Done()
 	for {
@@ -391,8 +417,8 @@ func (db *Olric) listenMemberlistEvents(eventCh chan *discovery.ClusterEvent) {
 		case <-db.ctx.Done():
 			return
 		case e := <-eventCh:
-			db.processNodeEvent(e)
-			db.updateRouting()
+			db.processNodeEvent(e) // 根据 ml 事件更新 db.members, db.consistent 和 db.numMembers 。
+			db.updateRouting()     //
 		}
 	}
 }

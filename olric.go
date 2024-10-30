@@ -273,10 +273,12 @@ func (db *Olric) bootstrapCoordinator() error {
 
 // startDiscovery initializes and starts discovery subsystem.
 func (db *Olric) startDiscovery() error {
+
 	d, err := discovery.New(db.log, db.config)
 	if err != nil {
 		return err
 	}
+
 	err = d.Start()
 	if err != nil {
 		return err
@@ -327,12 +329,13 @@ func (db *Olric) startDiscovery() error {
 
 	// Check member count quorum now. If there is no enough peers to work, wait forever.
 	for {
+		// 检查当前集群中的成员数量是否满足配置要求的法定节点数（Quorum）。
 		err := db.checkMemberCountQuorum()
 		if err == nil {
 			// It's OK. Continue as usual.
 			break
 		}
-
+		// 未达到要求，等待 1s 后重试
 		db.log.V(2).Printf("[ERROR] Inoperable node: %v", err)
 		select {
 		// TODO: Consider making this parametric
@@ -342,6 +345,8 @@ func (db *Olric) startDiscovery() error {
 			return nil
 		}
 	}
+
+	// 至此，集群中节点数达到要求 Quorum
 
 	db.members.mtx.Lock()
 	db.members.m[db.this.ID] = db.this
@@ -531,6 +536,8 @@ func (db *Olric) checkBootstrap() error {
 }
 
 // storeNumMembers assigns the current number of members in the cluster to a variable.
+//
+// 获取当前集群成员的数量存储到 db.numMembers 中，因为成员数量的变化不频繁，这样能避免频繁调用 NumMembers() 接口。
 func (db *Olric) storeNumMembers() {
 	// Calling NumMembers in every request is quite expensive.
 	// It's rarely updated. Just call this when the membership info changed.
@@ -538,6 +545,8 @@ func (db *Olric) storeNumMembers() {
 	atomic.StoreInt32(&db.numMembers, nr)
 }
 
+// 检查当前集群中的成员数量是否满足配置要求的法定节点数（Quorum）。
+// 如果当前成员数量低于所需的法定人数，函数将返回一个错误 ErrClusterQuorum 。
 func (db *Olric) checkMemberCountQuorum() error {
 	// This type of quorum function determines the presence of quorum based on the count of members in the cluster,
 	// as observed by the local member’s cluster membership manager

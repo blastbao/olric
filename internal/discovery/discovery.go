@@ -98,19 +98,24 @@ func (d *Discovery) DecodeNodeMeta(buf []byte) (Member, error) {
 
 // New creates a new memberlist with a proper configuration and returns a new Discovery instance along with it.
 func New(log *flog.Logger, c *config.Config) (*Discovery, error) {
+
 	// Calculate host's identity. It's useful to compare hosts.
+	// 创建时间，纳秒时间戳
 	birthdate := time.Now().UnixNano()
 
+	// buf := ts(8B) + name(xxB)
 	buf := make([]byte, 8+len(c.MemberlistConfig.Name))
 	binary.BigEndian.PutUint64(buf, uint64(birthdate))
 	buf = append(buf, []byte(c.MemberlistConfig.Name)...)
 
+	// 基于 buf 计算 hash 值作为节点 ID
 	id := c.Hasher.Sum64(buf)
 	host := &Member{
 		Name:      c.MemberlistConfig.Name,
 		ID:        id,
 		Birthdate: birthdate,
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Discovery{
 		host:        host,
@@ -121,11 +126,13 @@ func New(log *flog.Logger, c *config.Config) (*Discovery, error) {
 		cancel:      cancel,
 	}
 
+	// 如果指定了 discovery ，里面可能指定了 plugin 或者 plugin path ，加载进来。
 	if c.ServiceDiscovery != nil {
 		if err := d.loadServiceDiscoveryPlugin(); err != nil {
 			return nil, err
 		}
 	}
+
 	return d, nil
 }
 
@@ -159,6 +166,7 @@ func (d *Discovery) loadServiceDiscoveryPlugin() error {
 	if err := sd.SetConfig(d.config.ServiceDiscovery); err != nil {
 		return err
 	}
+
 	sd.SetLogger(d.config.Logger)
 	if err := sd.Initialize(); err != nil {
 		return err
@@ -171,18 +179,22 @@ func (d *Discovery) loadServiceDiscoveryPlugin() error {
 func (d *Discovery) dialDeadMember(member string) {
 	// Knock knock
 	// TODO: Make this parametric
+	// 建立连接，成功则 err == nil
 	conn, err := net.DialTimeout("tcp", member, 100*time.Millisecond)
 	if err != nil {
 		d.log.V(5).Printf("[ERROR] Failed to dial member: %s: %v", member, err)
 		return
 	}
-	err = conn.Close()
-	if err != nil {
+
+	// 建连成功，关闭连接
+	if err = conn.Close(); err != nil {
 		d.log.V(5).Printf("[ERROR] Failed to close connection: %s: %v", member, err)
 		// network partitioning continues
 		return
 	}
+
 	// Everything seems fine. Try to re-join!
+	// 尝试将当前节点加入 member 所在集群中
 	_, err = d.Rejoin([]string{member})
 	if err != nil {
 		d.log.V(5).Printf("[ERROR] Failed to re-join: %s: %v", member, err)
@@ -207,10 +219,12 @@ func (d *Discovery) deadMemberTracker() {
 					e.NodeName, e.Event)
 			}
 		case <-time.After(time.Second):
+			// 每秒钟尝试连接一个 dead member
 			// TODO: make this parametric
 			// Try to reconnect a random dead member every second.
 			// The Go runtime selects a random item in the map
 			for member, timestamp := range d.deadMembers {
+				// 尝试将当前节点加入 member 所在集群中
 				d.dialDeadMember(member)
 				// TODO: Make this parametric
 				if time.Now().Add(24*time.Hour).UnixNano() >= timestamp {
@@ -218,15 +232,17 @@ func (d *Discovery) deadMemberTracker() {
 				}
 				break
 			}
+
 			// Just try one item
 		}
 	}
 }
 
 func (d *Discovery) Start() error {
+
 	// ClusterEvents chan is consumed by the Olric package to maintain a consistent hash ring.
-	d.ClusterEvents = d.SubscribeNodeEvents()
-	d.deadMemberEvents = d.SubscribeNodeEvents()
+	d.ClusterEvents = d.SubscribeNodeEvents()    // 订阅 ml 事件
+	d.deadMemberEvents = d.SubscribeNodeEvents() // 订阅 ml 事件
 
 	// Initialize a new memberlist
 	dl, err := d.newDelegate()
@@ -243,6 +259,7 @@ func (d *Discovery) Start() error {
 	if err != nil {
 		return err
 	}
+
 	d.memberlist = list
 
 	if d.serviceDiscovery != nil {
@@ -252,7 +269,7 @@ func (d *Discovery) Start() error {
 	}
 
 	d.wg.Add(2)
-	go d.eventLoop(eventsCh)
+	go d.eventLoop(eventsCh) // 处理 ml 事件，转发给 subscribers
 	go d.deadMemberTracker()
 	return nil
 }
@@ -277,14 +294,15 @@ func (d *Discovery) Rejoin(peers []string) (int, error) {
 }
 
 // GetMembers returns a full list of known alive nodes.
+//
+// 返回 ml 集群中所有节点，按照启动时间排序。
 func (d *Discovery) GetMembers() []Member {
 	var members []Member
-	nodes := d.memberlist.Members()
+	nodes := d.memberlist.Members() // 获取所有节点
 	for _, node := range nodes {
-		member, _ := d.DecodeNodeMeta(node.Meta)
+		member, _ := d.DecodeNodeMeta(node.Meta) // 解析节点元数据
 		members = append(members, member)
 	}
-
 	// sort members by birthdate
 	sort.Slice(members, func(i int, j int) bool {
 		return members[i].Birthdate < members[j].Birthdate
@@ -320,11 +338,13 @@ func (d *Discovery) FindMemberByID(id uint64) (Member, error) {
 
 // GetCoordinator returns the oldest node in the memberlist.
 func (d *Discovery) GetCoordinator() Member {
+	// 返回 ml 集群中所有节点，按照启动时间排序
 	members := d.GetMembers()
 	if len(members) == 0 {
 		d.log.V(1).Printf("[ERROR] There is no member in memberlist")
 		return Member{}
 	}
+	// 启动时间最早的 node 为 coordinator
 	return members[0]
 }
 
@@ -375,28 +395,30 @@ func (d *Discovery) Shutdown() error {
 
 func convertToClusterEvent(e memberlist.NodeEvent) *ClusterEvent {
 	return &ClusterEvent{
-		Event:    e.Event,
-		NodeName: e.Node.Name,
-		NodeAddr: e.Node.Addr,
-		NodePort: e.Node.Port,
-		NodeMeta: e.Node.Meta,
+		Event:    e.Event,     // 事件类型：Join/Leave/Update
+		NodeName: e.Node.Name, // 节点名
+		NodeAddr: e.Node.Addr, // 地址
+		NodePort: e.Node.Port, // 端口
+		NodeMeta: e.Node.Meta, // 元数据
 	}
 }
 
+// 把 ml 事件转发给 subscribers
 func (d *Discovery) handleEvent(event memberlist.NodeEvent) {
 	d.clusterEventsMtx.RLock()
 	defer d.clusterEventsMtx.RUnlock()
 
 	for _, ch := range d.eventSubscribers {
+		// 如果 ml 事件是本机产生的，忽略
 		if event.Node.Name == d.host.Name {
 			continue
 		}
-		// NodeJoin or NodeLeave
+		// 如果 ml 事件是 NodeJoin or NodeLeave ，转发给 Subscriber
 		if event.Event != memberlist.NodeUpdate {
 			ch <- convertToClusterEvent(event)
 			continue
 		}
-
+		// 如果 ml 事件是 NodeUpdate ，转换为先 NodeLeave 再 NodeJoin 两个事件；
 		// NodeUpdate: Olric is an in-memory k/v store. If the node metadata has been updated,
 		// the node may be restarted or/and serves stale data.
 		e := convertToClusterEvent(event)
@@ -410,9 +432,10 @@ func (d *Discovery) handleEvent(event memberlist.NodeEvent) {
 }
 
 // eventLoop awaits for messages from memberlist and broadcasts them to  event listeners.
+//
+// 处理 ml 事件，转发给 subscribers
 func (d *Discovery) eventLoop(eventsCh chan memberlist.NodeEvent) {
 	defer d.wg.Done()
-
 	for {
 		select {
 		case e := <-eventsCh:
@@ -423,6 +446,7 @@ func (d *Discovery) eventLoop(eventsCh chan memberlist.NodeEvent) {
 	}
 }
 
+// SubscribeNodeEvents 注册 ml 事件的 subscriber
 func (d *Discovery) SubscribeNodeEvents() chan *ClusterEvent {
 	d.clusterEventsMtx.Lock()
 	defer d.clusterEventsMtx.Unlock()
@@ -432,9 +456,19 @@ func (d *Discovery) SubscribeNodeEvents() chan *ClusterEvent {
 	return ch
 }
 
+// 通过 ml.Delegate 可以在节点之间传递自定义的元数据和处理用户数据消息。
+// 这个接口允许开发者在节点加入、离开或更新时，执行一些自定义的逻辑。
+//
+// Delegate 接口定义了以下方法：
+//	NodeMeta: 返回一个字节数组，代表当前节点的元数据。这些元数据会在节点加入集群时广播给其他节点。
+//	NotifyMsg: 当节点接收到用户数据消息时调用。用户可以通过这个方法处理接收到的消息。
+//	GetBroadcasts: 返回需要广播给其他节点的用户数据消息。可以通过这个方法向其他节点发送自定义消息。
+//	LocalState: 返回当前节点的本地状态数据。当节点加入集群或进行状态同步时调用。
+//	MergeRemoteState: 当接收到其他节点的状态数据时调用。用于将远程节点的状态数据合并到本地状态中。
+
 // delegate is a struct which implements memberlist.Delegate interface.
 type delegate struct {
-	meta []byte
+	meta []byte // 存储本节点信息：节点名、节点 ID 、启动时间
 }
 
 // newDelegate returns a new delegate instance.
@@ -451,6 +485,8 @@ func (d *Discovery) newDelegate() (delegate, error) {
 // NodeMeta is used to retrieve meta-data about the current node
 // when broadcasting an alive message. It's length is limited to
 // the given byte size. This metadata is available in the Node structure.
+//
+// 节点加入集群时，会将 meta 广播给集群内各节点
 func (d delegate) NodeMeta(limit int) []byte {
 	return d.meta
 }
