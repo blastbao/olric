@@ -97,19 +97,25 @@ func readHeader(conn io.ReadWriteCloser) (Header, error) {
 	defer pool.Put(buf)
 
 	// Read the header section. The first 6 bytes.
+	// 读取 6 byte
 	var header Header
 	_, err := io.CopyN(buf, conn, headerSize)
 	if err != nil {
 		return header, filterNetworkErrors(err)
 	}
 
+	// 解析 header
 	err = binary.Read(buf, binary.BigEndian, &header)
 	if err != nil {
 		return header, err
 	}
+
+	// header 合法性校验
 	if err := checkProtocolVersion(&header); err != nil {
 		return header, err
 	}
+
+	// 返回
 	return header, nil
 }
 
@@ -117,13 +123,14 @@ func readHeader(conn io.ReadWriteCloser) (Header, error) {
 // Header can be used to determine message. Then you can pick an appropriate message
 // type and decode it.
 func ReadMessage(src io.ReadWriteCloser, dst *bytes.Buffer) (Header, error) {
+	// 读取 6 byte 的 header
 	header, err := readHeader(src)
 	if err != nil {
 		return Header{}, err
 	}
 
-	// Read the whole message. Now, the caller knows the message type and she can
-	// Decode method.
+	// Read the whole message. Now, the caller knows the message type and she can Decode method.
+	// 从 src 中读取 length 的 body 并写入到 dst 中，返回拷贝成功的字节数
 	length := int64(header.MessageLength)
 	nr, err := io.CopyN(dst, src, length)
 	if err != nil {

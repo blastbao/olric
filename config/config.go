@@ -182,21 +182,29 @@ type CacheConfig struct {
 type Config struct {
 	// Interface denotes a binding interface. It can be used instead of BindAddr if the interface is known but not the address.
 	// If both are provided, then Olric verifies that the interface has the bind address that is provided.
+	//
+	// 绑定的网络接口。
+	// 如果已知网络接口但不知道地址，可以用它代替 BindAddr，如果两者都提供，Olric 会验证网络接口是否具有 BindAddr 网络地址。
 	Interface string
 
 	// LogVerbosity denotes the level of message verbosity. The default value is 3. Valid values are between 1 to 6.
+	// 日志消息的详细程度。默认值是 3 ，有效值在 1 到 6 之间。
 	LogVerbosity int32
 
 	// Default LogLevel is DEBUG. Valid ones: "DEBUG", "WARN", "ERROR", "INFO"
+	// 日志级别。有效值："DEBUG", "WARN", "ERROR", "INFO"
 	LogLevel string
 
 	// BindAddr denotes the address that Olric will bind to for communication with other Olric nodes.
+	// 绑定地址，用于与其他 Olric 节点通信
 	BindAddr string
 
 	// BindPort denotes the address that Olric will bind to for communication with other Olric nodes.
+	// 绑定端口，用于与其他 Olric 节点通信
 	BindPort int
 
 	// KeepAlivePeriod denotes whether the operating system should send keep-alive messages on the connection.
+	// 操作系统是否应在连接上发送保活消息。
 	KeepAlivePeriod time.Duration
 
 	// Timeout for TCP dial.
@@ -204,29 +212,38 @@ type Config struct {
 	// The timeout includes name resolution, if required. When using TCP, and the host in the address parameter
 	// resolves to multiple IP addresses, the timeout is spread over each consecutive dial, such that each is
 	// given an appropriate fraction of the time to connect.
+	//
+	// TCP 拨号的超时时间。
 	DialTimeout time.Duration
 
 	RequestTimeout time.Duration
 
 	// The list of host:port which are used by memberlist for discovery. Don't confuse it with Name.
+	// memberlist 种子节点
 	Peers []string
 
 	// PartitionCount is 271, by default.
+	// 分区数
 	PartitionCount uint64
 
 	// ReplicaCount is 1, by default.
+	// 副本数
 	ReplicaCount int
 
 	// Minimum number of successful reads to return a response for a read request.
+	// 读请求所需的最小成功节点数
 	ReadQuorum int
 
 	// Minimum number of successful writes to return a response for a write request.
+	// 写请求所需的最小成功节点数
 	WriteQuorum int
 
 	// Minimum number of members to form a cluster and run any query on the cluster.
+	// 形成集群并在集群上运行任何操作所需的最小成员数。
 	MemberCountQuorum int32
 
 	// Switch to control read-repair algorithm which helps to reduce entropy.
+	// 控制读修复算法的开关，该算法有助于减少熵。
 	ReadRepair bool
 
 	// Default value is SyncReplicationMode.
@@ -234,28 +251,39 @@ type Config struct {
 
 	// LoadFactor is used by consistent hashing function. It determines the maximum load
 	// for a server in the cluster. Keep it small.
+	// LoadFactor 由一致性哈希函数使用。
 	LoadFactor float64
 
 	// Default hasher is github.com/cespare/xxhash
 	Hasher hasher.Hasher
 
 	// Default Serializer implementation uses gob for encoding/decoding.
+	// 默认使用 gob 进行编码/解码。
 	Serializer serializer.Serializer
 
 	// LogOutput is the writer where logs should be sent. If this is not
 	// set, logging will go to stderr by default. You cannot specify both LogOutput
 	// and Logger at the same time.
+	//
+	// LogOutput 指定日志写入到哪里。
+	// 如果未设置，日志将默认发送到 stderr。
+	// 不能同时指定 LogOutput 和 Logger。
 	LogOutput io.Writer
 
 	// Logger is a custom logger which you provide. If Logger is set, it will use
 	// this for the internal logger. If Logger is not set, it will fall back to the
 	// behavior for using LogOutput. You cannot specify both LogOutput and Logger
 	// at the same time.
+	//
+	// Logger 是您提供的自定义日志记录器。如果设置了 Logger，将使用此内部日志记录器。
+	// 如果未设置 Logger，将回退到使用 LogOutput 的行为。
+	// 不能同时指定 LogOutput 和 Logger。
 	Logger *log.Logger
 
 	Cache *CacheConfig
 
 	// Minimum size(in-bytes) for append-only file
+	// 文件大小（以字节为单位）
 	TableSize int
 
 	JoinRetryInterval time.Duration
@@ -263,6 +291,8 @@ type Config struct {
 
 	// Callback function. Olric calls this after
 	// the server is ready to accept new connections.
+	//
+	// 回调函数。Olric 在服务器准备好接受新连接后调用此函数。
 	Started func()
 
 	ServiceDiscovery map[string]interface{}
@@ -270,6 +300,9 @@ type Config struct {
 	// Interface denotes a binding interface. It can be used instead of memberlist.Config.BindAddr if the interface is
 	// known but not the address. If both are provided, then Olric verifies that the interface has the bind address that
 	// is provided.
+	//
+	// MemberlistInterface 表示 Memberlist 绑定的网络接口。
+	// 如果已知接口但不知道地址，可以用 MemberlistInterface 代替 memberlist.Config.BindAddr 使用，如果两者都提供，Olric 会验证接口是否具有提供的绑定地址。
 	MemberlistInterface string
 
 	// MemberlistConfig is the memberlist configuration that Olric will
@@ -286,6 +319,12 @@ type Config struct {
 	//
 	// You have to use NewMemberlistConfig to create a new one.
 	// Then, you may need to modify it to tune for your environment.
+	//
+	// MemberlistConfig 是 Olric 将用于执行成员管理的 memberlist 配置。
+	// 无论如何，Olric 都会覆盖 MemberlistConfig 中的一些字段：
+	//   * Name - 这将始终设置为与此配置中的 NodeName 相同。
+	//   * ClusterEvents - Olric 使用自定义事件委托。
+	//   * Delegate - Olric 使用自定义委托。
 	MemberlistConfig *memberlist.Config
 }
 
@@ -337,6 +376,8 @@ func (c *Config) validateMemberlistConfig() error {
 // Validate validates the given configuration.
 func (c *Config) Validate() error {
 	var result error
+
+	// 副本数至少为 1
 	if c.ReplicaCount < MinimumReplicaCount {
 		result = multierror.Append(result,
 			fmt.Errorf("cannot specify ReplicaCount smaller than MinimumReplicaCount"))
@@ -412,6 +453,7 @@ func (c *Config) Sanitize() error {
 		}
 		c.BindAddr = name
 	}
+
 	// We currently don't support ephemeral port selection. Because it needs improved flow
 	// control in server initialization stage.
 	if c.BindPort == 0 {

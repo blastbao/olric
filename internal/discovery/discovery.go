@@ -126,7 +126,8 @@ func New(log *flog.Logger, c *config.Config) (*Discovery, error) {
 		cancel:      cancel,
 	}
 
-	// 如果指定了 discovery ，里面可能指定了 plugin 或者 plugin path ，加载进来。
+	// 如果指定了 ServiceDiscovery ，里面可能指定了 plugin 或者 plugin path ，加载进来。
+	// ServiceDiscovery 用于发现 ml peers
 	if c.ServiceDiscovery != nil {
 		if err := d.loadServiceDiscoveryPlugin(); err != nil {
 			return nil, err
@@ -239,7 +240,6 @@ func (d *Discovery) deadMemberTracker() {
 }
 
 func (d *Discovery) Start() error {
-
 	// ClusterEvents chan is consumed by the Olric package to maintain a consistent hash ring.
 	d.ClusterEvents = d.SubscribeNodeEvents()    // 订阅 ml 事件
 	d.deadMemberEvents = d.SubscribeNodeEvents() // 订阅 ml 事件
@@ -262,6 +262,7 @@ func (d *Discovery) Start() error {
 
 	d.memberlist = list
 
+	// 如果配置了 serviceDiscovery 就注册一下，方便别的节点发现自己
 	if d.serviceDiscovery != nil {
 		if err := d.serviceDiscovery.Register(); err != nil {
 			return err
@@ -269,8 +270,8 @@ func (d *Discovery) Start() error {
 	}
 
 	d.wg.Add(2)
-	go d.eventLoop(eventsCh) // 处理 ml 事件，转发给 subscribers
-	go d.deadMemberTracker()
+	go d.eventLoop(eventsCh) // 处理 ml 事件，转发给 subscribers ，即上面两个管道 d.ClusterEvents/d.deadMemberEvents
+	go d.deadMemberTracker() //
 	return nil
 }
 
@@ -450,7 +451,6 @@ func (d *Discovery) eventLoop(eventsCh chan memberlist.NodeEvent) {
 func (d *Discovery) SubscribeNodeEvents() chan *ClusterEvent {
 	d.clusterEventsMtx.Lock()
 	defer d.clusterEventsMtx.Unlock()
-
 	ch := make(chan *ClusterEvent, eventChanCapacity)
 	d.eventSubscribers = append(d.eventSubscribers, ch)
 	return ch

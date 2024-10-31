@@ -63,6 +63,7 @@ func (p *partition) loadOwners() []discovery.Member {
 	return owners.([]discovery.Member)
 }
 
+// 遍历 part 下所有 dmap 获取总数据条数
 func (p *partition) length() int {
 	var length int
 	p.m.Range(func(_, dm interface{}) bool {

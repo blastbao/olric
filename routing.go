@@ -152,7 +152,10 @@ func (db *Olric) distributeBackups(partID uint64) []discovery.Member {
 }
 
 func (db *Olric) distributePrimaryCopies(partID uint64) []discovery.Member {
+
 	// First you need to create a copy of the owners list. Don't modify the current list.
+	//
+	//
 	part := db.partitions[partID]
 	owners := make([]discovery.Member, part.ownerCount())
 	copy(owners, part.loadOwners())
@@ -225,26 +228,32 @@ func (db *Olric) distributePrimaryCopies(partID uint64) []discovery.Member {
 	return append(owners, newOwner.(discovery.Member))
 }
 
-// 生成新路由表，该路由表包含集群中所有分区及其对应的主副本和备份副本的分布信息。
-// 这个函数遍历所有分区，并为每个分区分配主副本和备份副本。
+// 构造空路由表
+//
+// 遍历分区，逐个分区填充其路由表项
+//   - 获取当前分区的路由表项
+//   - 设置主副本
+//   - 设置备份副本(如果指定需要备份副本)
+//   - 更新路由表项
+//
+// 返回已填充路由表
 func (db *Olric) distributePartitions() routingTable {
 	table := make(routingTable)
-	// 分区数由 db.config.PartitionCount 决定
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {
-		// 获取当前分区 ID 对应的路由表项 item
 		item := table[partID]
-		// 为当前分区分配主副本
 		item.Owners = db.distributePrimaryCopies(partID)
-		// 为当前分区分配备份副本
-		if db.config.ReplicaCount > config.MinimumReplicaCount { // 备份副本数
+		if db.config.ReplicaCount > config.MinimumReplicaCount {
 			item.Backups = db.distributeBackups(partID)
 		}
-		// 更新路由表项 item
 		table[partID] = item
 	}
 	return table
 }
 
+// 将路由表 table 序列化，以便 rpc 集群发送
+// 构造 UpdateRouting 系统消息，并行发送给集群中各个节点，由信号量 sem 控制并行度不超过系统核数
+// 逐个接收集群中各个节点返回的响应 `ownershipReport` ，其包含了该节点上有效的分区列表
+// 汇总各个节点的 ownershipReports 并返回
 func (db *Olric) updateRoutingTableOnCluster(table routingTable) (map[discovery.Member]ownershipReport, error) {
 	data, err := msgpack.Marshal(table)
 	if err != nil {
@@ -252,10 +261,11 @@ func (db *Olric) updateRoutingTableOnCluster(table routingTable) (map[discovery.
 	}
 
 	var mtx sync.Mutex
-	var g errgroup.Group
 	ownershipReports := make(map[discovery.Member]ownershipReport)
+
 	num := int64(runtime.NumCPU())
 	sem := semaphore.NewWeighted(num)
+	var g errgroup.Group
 	for _, member := range db.consistent.GetMembers() {
 		mem := member.(discovery.Member)
 		g.Go(func() error {
@@ -293,16 +303,20 @@ func (db *Olric) updateRoutingTableOnCluster(table routingTable) (map[discovery.
 	return ownershipReports, g.Wait()
 }
 
+// 检查当前节点是否为集群的协调员，更新路由表只能由 coordinator 负责
+// 检查集群节点数量是否满足 Quorum 要求，如果不满足则不能更新路由表
+// 路由更新操作无法并行，加锁保护
+// 计算每个分区的主副本和备份副本，生成最新路由表
+// 将新路由表分发到集群中的所有节点，并将各节点返回的 report 汇总起来，report 包含该节点上有效的分区列表
+// 根据各节点上的分区信息更新本地路由表，确保 coordinator 包含最新最完整的分区路由信息，下次会继续广播给集群
 func (db *Olric) updateRouting() {
 	// This function is only run by the cluster coordinator.
-	// 检查当前节点是否为集群的协调员，更新路由表只能由 coordinator 负责。
 	if !db.discovery.IsCoordinator() {
 		return
 	}
 
 	// This type of quorum function determines the presence of quorum based on the count of members in the cluster,
 	// as observed by the local member’s cluster membership manager
-	// 检查集群节点数量是否满足 Quorum 要求
 	nr := atomic.LoadInt32(&db.numMembers)
 	if db.config.MemberCountQuorum > nr {
 		db.log.V(2).Printf("[ERROR] Impossible to calculate and update routing table: %v", ErrClusterQuorum)
@@ -311,22 +325,27 @@ func (db *Olric) updateRouting() {
 
 	// This function is called by listenMemberlistEvents and updateRoutingPeriodically
 	// So this lock prevents parallel execution.
-	// 路由更新操作无法并行
 	routingMtx.Lock()
 	defer routingMtx.Unlock()
 
-	// 计算每个分区的主副本和备份副本的所有者，生成最新路由表
 	table := db.distributePartitions()
-	// 将新路由表分发到集群中的所有节点
 	reports, err := db.updateRoutingTableOnCluster(table)
 	if err != nil {
 		db.log.V(2).Printf("[ERROR] Failed to update routing table on cluster: %v", err)
 	}
-	// 从集群节点收集到的所有权报告。这一步确保每个节点上的数据分区和备份副本的所有权信息是最新的
-	db.processOwnershipReports(reports)
 
+	db.processOwnershipReports(reports)
 }
 
+// processOwnershipReports 汇总每个成员的分区信息到本机的路由表中；
+//
+// check 用于检查 member 是否在 owners 列表中
+// ensureOwnership 检查 member 是否是 part 的 owner ，如果不是则将 member 添加到 part 的 owner 列表头部
+//
+// 遍历每个 member 返回的 report ，其中包含该 member 上有效的 parts 和 backup parts ；
+//   - 遍历 member 的 parts
+//   - 如果 member 不存在于本地 db.partitions[partID] 的 owner 列表中，就添加进去；
+//   - 如果 member 不存在于本地 db.backups[partID] 的 owner 列表中，就添加进去；
 func (db *Olric) processOwnershipReports(reports map[discovery.Member]ownershipReport) {
 	check := func(member discovery.Member, owners []discovery.Member) bool {
 		for _, owner := range owners {
@@ -367,26 +386,31 @@ func (db *Olric) processOwnershipReports(reports map[discovery.Member]ownershipR
 	}
 }
 
-// 根据 ml 事件更新 db.members, db.consistent 和 db.numMembers 。
+// processNodeEvent 根据 ml 事件更新 db.members, db.consistent 和 db.numMembers 。
+//
+// 1. 解析事件节点的 node meta
+//
+// 2. 节点加入：
+//   - 将新节点添加到成员列表中 db.members.m 。
+//   - 将新节点添加到一致性哈希环 db.consistent 中。
+//
+// 3. 节点离开：
+//   - 检查节点是否在成员列表中，如果存在则删除。
+//   - 从一致性哈希环中移除该节点。
+//   - 关闭与该节点相关的连接池，避免再次使用已关闭的套接字。
+//
+// 4. 获取当前集群成员的数量存储到 db.numMembers 中
 func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 	db.members.mtx.Lock()
 	defer db.members.mtx.Unlock()
 
-	// 解析 node meta
 	member, _ := db.discovery.DecodeNodeMeta(event.NodeMeta)
 
-	// 节点加入：
-	//	- 将新节点添加到成员列表中 db.members.m 。
-	//	- 将新节点添加到一致性哈希环 db.consistent 中。
 	if event.Event == memberlist.NodeJoin {
 		db.members.m[member.ID] = member
 		db.consistent.Add(member)
 		db.log.V(2).Printf("[INFO] Node joined: %s", member)
 	} else if event.Event == memberlist.NodeLeave {
-		// 节点离开：
-		//	- 检查节点是否在成员列表中，如果存在则删除。
-		//	- 从一致性哈希环中移除该节点。
-		//	- 关闭与该节点相关的连接池，避免再次使用已关闭的套接字。
 		if _, ok := db.members.m[member.ID]; ok {
 			delete(db.members.m, member.ID)
 		} else {
@@ -395,7 +419,7 @@ func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 		}
 		db.consistent.Remove(event.NodeName)
 		// Don't try to used closed sockets again.
-		db.client.ClosePool(event.NodeName)
+		db.client.ClosePool(event.NodeName) // 关闭相关的连接池，释放资源
 		db.log.V(2).Printf("[INFO] Node left: %s", event.NodeName)
 	} else {
 		db.log.V(2).Printf("[ERROR] Unknown event received: %v", event)
@@ -404,8 +428,6 @@ func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 
 	// Store the current number of members in the member list.
 	// We need this to implement a simple split-brain protection algorithm.
-	//
-	// 更新节点数目
 	db.storeNumMembers()
 }
 
@@ -414,15 +436,16 @@ func (db *Olric) listenMemberlistEvents(eventCh chan *discovery.ClusterEvent) {
 	defer db.wg.Done()
 	for {
 		select {
-		case <-db.ctx.Done():
+		case <-db.ctx.Done(): // 超时
 			return
-		case e := <-eventCh:
-			db.processNodeEvent(e) // 根据 ml 事件更新 db.members, db.consistent 和 db.numMembers 。
-			db.updateRouting()     //
+		case e := <-eventCh: // ml 事件
+			db.processNodeEvent(e) // 根据 ml 事件(join/leave)更新 db.members, db.consistent 和 db.numMembers 。
+			db.updateRouting()     // 更新 partition 路由表
 		}
 	}
 }
 
+// 每分钟更新一次路由表并广播到 ml 集群，只有 Coordinator 有权广播
 func (db *Olric) updateRoutingPeriodically() {
 	defer db.wg.Done()
 	// TODO: Make this parametric.
@@ -439,17 +462,19 @@ func (db *Olric) updateRoutingPeriodically() {
 	}
 }
 
+// 1. 从 ml 集群取出 id 节点 member
+// 2. 从 ml 集群中取出启动时间最早的节点，它是 coordinator
+// 3. 比较二者是否是同一个节点，若不同则报错，否则返回 member
 func (db *Olric) checkAndGetCoordinator(id uint64) (discovery.Member, error) {
-	coordinator, err := db.discovery.FindMemberByID(id)
+	member, err := db.discovery.FindMemberByID(id)
 	if err != nil {
 		return discovery.Member{}, err
 	}
-
-	myCoordinator := db.discovery.GetCoordinator()
-	if !hostCmp(coordinator, myCoordinator) {
-		return discovery.Member{}, fmt.Errorf("unrecognized cluster coordinator: %s: %s", coordinator, myCoordinator)
+	coordinator := db.discovery.GetCoordinator()
+	if !hostCmp(member, coordinator) {
+		return discovery.Member{}, fmt.Errorf("unrecognized cluster coordinator: %s: %s", member, coordinator)
 	}
-	return coordinator, nil
+	return member, nil
 }
 
 func (db *Olric) setOwnedPartitionCount() {
@@ -464,6 +489,14 @@ func (db *Olric) setOwnedPartitionCount() {
 	atomic.StoreUint64(&db.ownedPartitionCount, count)
 }
 
+// 处理路由更新消息
+//   - 解析 `路由更新` 系统消息，得到 RouteTable 和 CoordinatorID ，只有 Coordinator 可以发布路由更新消息；
+//   - 根据 CoordinatorID 从 ml 集群中获取协调者，如果找不到或者不匹配则报错，以此确保消息来源合法；
+//   - 检查路由表中的路由表项总数等于分区数，不一致则报错（要求路由表包含每个分区的路由）
+//   - 计算 hash(RouteTable) 作为 routingSignature
+//   - 遍历 RouteTable 中每个 <part, route> ，更新到本地路由表 db.partitions/db.backups 上
+//   - 计算属于本节点的主分区总数，存储到 db.ownedPartitionCount
+//   - 获取本节点非空的主分区和备份分区 PartId 列表，存入 data 中返回给调用者
 func (db *Olric) updateRoutingOperation(w, r protocol.EncodeDecoder) {
 	routingUpdateMtx.Lock()
 	defer routingUpdateMtx.Unlock()
@@ -486,8 +519,7 @@ func (db *Olric) updateRoutingOperation(w, r protocol.EncodeDecoder) {
 
 	// Compare partition counts to catch a possible inconsistencies in configuration
 	if db.config.PartitionCount != uint64(len(table)) {
-		db.log.V(2).Printf("[ERROR] Routing table cannot be updated. "+
-			"Expected partition count is %d, got: %d", db.config.PartitionCount, uint64(len(table)))
+		db.log.V(2).Printf("[ERROR] Routing table cannot be updated. "+"Expected partition count is %d, got: %d", db.config.PartitionCount, uint64(len(table)))
 		db.errorResponse(w, ErrInvalidArgument)
 		return
 	}
@@ -509,12 +541,14 @@ func (db *Olric) updateRoutingOperation(w, r protocol.EncodeDecoder) {
 
 	// Bootstrapped by the coordinator.
 	atomic.StoreInt32(&db.bootstrapped, 1)
+
 	// Collect report
 	data, err := db.prepareOwnershipReport()
 	if err != nil {
 		db.errorResponse(w, ErrInvalidArgument)
 		return
 	}
+
 	w.SetStatus(protocol.StatusOK)
 	w.SetValue(data)
 
@@ -523,18 +557,19 @@ func (db *Olric) updateRoutingOperation(w, r protocol.EncodeDecoder) {
 	go func() {
 		defer db.wg.Done()
 		db.rebalancer()
-
 		// Clean stale dmaps
 		db.deleteStaleDMaps()
 	}()
 	db.log.V(3).Printf("[INFO] Routing table has been pushed by %s", coordinator)
 }
 
+// 包含非空的主分区和备份分区 PartId 列表
 type ownershipReport struct {
 	Partitions []uint64
 	Backups    []uint64
 }
 
+// 遍历每个 part ，如果其主分区非空，就将 PartID 存入 res.Partitions ，同理备份分区；
 func (db *Olric) prepareOwnershipReport() ([]byte, error) {
 	res := ownershipReport{}
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {
@@ -542,7 +577,6 @@ func (db *Olric) prepareOwnershipReport() ([]byte, error) {
 		if part.length() != 0 {
 			res.Partitions = append(res.Partitions, partID)
 		}
-
 		backup := db.backups[partID]
 		if backup.length() != 0 {
 			res.Backups = append(res.Backups, partID)

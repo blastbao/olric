@@ -126,6 +126,7 @@ type Olric struct {
 	server *transport.Server
 
 	// A full list of alive members. It's required for Pub/Sub and event dispatching systems.
+	// 包含所有活跃节点
 	members members
 
 	// Dispatch topic messages
@@ -152,38 +153,41 @@ func New(c *config.Config) (*Olric, error) {
 	if c == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
+
+	// 填充默认配置
 	err := c.Sanitize()
 	if err != nil {
 		return nil, err
 	}
+
+	// 验证配置合法性
 	err = c.Validate()
 	if err != nil {
 		return nil, err
 	}
+
+	// 配置监听地址：c.BindAddr、c.MemberlistConfig.BindAddr、c.MemberlistConfig.AdvertiseAddr
 	err = c.SetupNetworkConfig()
 	if err != nil {
 		return nil, err
 	}
+
+	// 覆盖 ml 节点名
 	c.MemberlistConfig.Name = net.JoinHostPort(c.BindAddr, strconv.Itoa(c.BindPort))
 
+	// 构造一致性哈希配置
 	cfg := consistent.Config{
-		Hasher:            c.Hasher,
-		PartitionCount:    int(c.PartitionCount),
-		ReplicationFactor: 20, // TODO: This also may be a configuration param.
-		Load:              c.LoadFactor,
+		Hasher:            c.Hasher,              // 哈希函数
+		PartitionCount:    int(c.PartitionCount), // 分区数
+		ReplicationFactor: 20,                    // member 在一致性哈希环上被复制的次数 // TODO: This also may be a configuration param.
+		Load:              c.LoadFactor,          // 计算平均负载
 	}
-	cc := &transport.ClientConfig{
-		DialTimeout: c.DialTimeout,
-		KeepAlive:   c.KeepAlivePeriod,
-		MaxConn:     1024, // TODO: Make this configurable.
-	}
-	client := transport.NewClient(cc)
-	ctx, cancel := context.WithCancel(context.Background())
 
+	// 初始化 logger
 	filter := &logutils.LevelFilter{
-		Levels:   []logutils.LogLevel{"DEBUG", "WARN", "ERROR", "INFO"},
-		MinLevel: logutils.LogLevel(strings.ToUpper(c.LogLevel)),
-		Writer:   c.LogOutput,
+		Levels:   []logutils.LogLevel{"DEBUG", "WARN", "ERROR", "INFO"}, // 日志级别
+		MinLevel: logutils.LogLevel(strings.ToUpper(c.LogLevel)),        // 最小级别
+		Writer:   c.LogOutput,                                           // output
 	}
 	c.Logger.SetOutput(filter)
 
@@ -193,12 +197,21 @@ func New(c *config.Config) (*Olric, error) {
 		flogger.ShowLineNumber(1)
 	}
 
+	// 构造 rpc client ，内置 addr 维度的 conn pool
+	cc := &transport.ClientConfig{
+		DialTimeout: c.DialTimeout,
+		KeepAlive:   c.KeepAlivePeriod,
+		MaxConn:     1024, // TODO: Make this configurable.
+	}
+	client := transport.NewClient(cc)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	db := &Olric{
-		name:       c.MemberlistConfig.Name,
+		name:       c.MemberlistConfig.Name, // 节点名
 		ctx:        ctx,
 		cancel:     cancel,
-		log:        flogger,
-		config:     c,
+		log:        flogger, // logger
+		config:     c,       // 配置
 		hasher:     c.Hasher,
 		locker:     locker.New(),
 		serializer: c.Serializer,
@@ -214,14 +227,17 @@ func New(c *config.Config) (*Olric, error) {
 		started:    c.Started,
 	}
 
+	// 用于处理传入请求并返回响应
 	db.server.SetDispatcher(db.requestDispatcher)
 
 	// Create all the partitions. It's read-only. No need for locking.
+	// 创建 n 个 main partition
 	for i := uint64(0); i < c.PartitionCount; i++ {
 		db.partitions[i] = &partition{id: i}
 	}
 
 	// Create all the backup partitions. It's read-only. No need for locking.
+	// 创建 n 个 backup partition
 	for i := uint64(0); i < c.PartitionCount; i++ {
 		db.backups[i] = &partition{
 			id:     i,
@@ -229,6 +245,7 @@ func New(c *config.Config) (*Olric, error) {
 		}
 	}
 
+	// 注册请求处理函数
 	db.registerOperations()
 	return db, nil
 }
@@ -237,9 +254,14 @@ func (db *Olric) passCheckpoint() {
 	atomic.AddInt32(&db.passedCheckpoints, 1)
 }
 
+// requestDispatcher 函数用于处理传入的请求
 func (db *Olric) requestDispatcher(w, r protocol.EncodeDecoder) {
 	// Check bootstrapping status
 	// Exclude protocol.OpUpdateRouting. The node is bootstrapped by this operation.
+	//
+	// 检查节点引导状态：
+	//	除了 protocol.OpUpdateRouting 操作外，其他操作在执行前都会检查节点是否完成引导（初始化）状态。
+	//  OpUpdateRouting 是一个特殊操作，不需要检查节点的引导状态，它用于更新节点的路由信息。
 	if r.OpCode() != protocol.OpUpdateRouting {
 		if err := db.checkOperationStatus(); err != nil {
 			db.errorResponse(w, err)
@@ -247,12 +269,14 @@ func (db *Olric) requestDispatcher(w, r protocol.EncodeDecoder) {
 		}
 	}
 
-	// Run the incoming command.
+	// 根据请求的操作码 r.OpCode()，在 db.operations 中查找对应的处理函数。
 	f, ok := db.operations[r.OpCode()]
 	if !ok {
 		db.errorResponse(w, ErrUnknownOperation)
 		return
 	}
+
+	// Run the incoming command.
 	f(w, r)
 }
 
@@ -272,13 +296,14 @@ func (db *Olric) bootstrapCoordinator() error {
 }
 
 // startDiscovery initializes and starts discovery subsystem.
+//
+// 从 ml 中获取自己对应的 node 并保存
 func (db *Olric) startDiscovery() error {
 
 	d, err := discovery.New(db.log, db.config)
 	if err != nil {
 		return err
 	}
-
 	err = d.Start()
 	if err != nil {
 		return err
@@ -304,8 +329,7 @@ func (db *Olric) startDiscovery() error {
 			break
 		}
 
-		db.log.V(2).Printf("[INFO] Awaits for %s to join again (%d/%d)",
-			db.config.JoinRetryInterval, attempts, db.config.MaxJoinAttempts)
+		db.log.V(2).Printf("[INFO] Awaits for %s to join again (%d/%d)", db.config.JoinRetryInterval, attempts, db.config.MaxJoinAttempts)
 		<-time.After(db.config.JoinRetryInterval)
 	}
 
@@ -346,13 +370,15 @@ func (db *Olric) startDiscovery() error {
 		}
 	}
 
-	// 至此，集群中节点数达到要求 Quorum
+	// 至此，集群中节点数达到要求 Quorum，可以继续执行
 
+	// 把自己加入到活跃成员列表
 	db.members.mtx.Lock()
 	db.members.m[db.this.ID] = db.this
 	db.members.mtx.Unlock()
-
+	// 把字节加入到一致性哈希环
 	db.consistent.Add(db.this)
+	// 如果当前节点是 coordinator ，需要执行 bootstrap 操作
 	if db.discovery.IsCoordinator() {
 		err = db.bootstrapCoordinator()
 		if err == consistent.ErrInsufficientMemberCount {
@@ -365,22 +391,15 @@ func (db *Olric) startDiscovery() error {
 		}
 	}
 
+	// 信息打印
 	if db.config.Interface != "" {
 		db.log.V(2).Printf("[INFO] Olric uses interface: %s", db.config.Interface)
 	}
-
-	db.log.V(2).Printf("[INFO] Olric bindAddr: %s, bindPort: %d",
-		db.config.BindAddr,
-		db.config.BindPort)
-
+	db.log.V(2).Printf("[INFO] Olric bindAddr: %s, bindPort: %d", db.config.BindAddr, db.config.BindPort)
 	if db.config.MemberlistInterface != "" {
 		db.log.V(2).Printf("[INFO] Memberlist uses interface: %s", db.config.MemberlistInterface)
 	}
-
-	db.log.V(2).Printf("[INFO] Memberlist bindAddr: %s, bindPort: %d",
-		db.config.MemberlistConfig.BindAddr,
-		db.config.MemberlistConfig.BindPort)
-
+	db.log.V(2).Printf("[INFO] Memberlist bindAddr: %s, bindPort: %d", db.config.MemberlistConfig.BindAddr, db.config.MemberlistConfig.BindPort)
 	db.log.V(2).Printf("[INFO] Cluster coordinator: %s", db.discovery.GetCoordinator())
 	return nil
 }
@@ -460,9 +479,7 @@ func (db *Olric) requestTo(addr string, req protocol.EncodeDecoder) (protocol.En
 	if err != nil {
 		return nil, err
 	}
-
 	status := resp.Status()
-
 	switch {
 	case status == protocol.StatusOK:
 		return resp, nil
@@ -512,6 +529,10 @@ func (db *Olric) isAlive() bool {
 
 // checkBootstrap is called for every request and checks whether the node is bootstrapped.
 // It has to be very fast for a smooth operation.
+//
+// 检查当前节点是否已经完成引导，若没完成则进入循环等待，每 100 毫秒检查一次，直到完成引导或者节点退出。
+//
+
 func (db *Olric) checkBootstrap() error {
 	// check it immediately
 	if atomic.LoadInt32(&db.bootstrapped) == 1 {
@@ -558,6 +579,8 @@ func (db *Olric) checkMemberCountQuorum() error {
 }
 
 // checkOperationStatus controls bootstrapping status and cluster quorum to prevent split-brain syndrome.
+//
+// 检查当前集群中的成员数量是否满足配置要求的法定节点数（Quorum）。
 func (db *Olric) checkOperationStatus() error {
 	if err := db.checkMemberCountQuorum(); err != nil {
 		return err
@@ -569,6 +592,8 @@ func (db *Olric) checkOperationStatus() error {
 // Start starts background servers and joins the cluster. You still need to call Shutdown method if
 // Start function returns an early error.
 func (db *Olric) Start() error {
+
+	// 启动 ListenAndServe 协程：接收连接处理请求
 	errCh := make(chan error, 1)
 	db.wg.Add(1)
 	go func() {
@@ -576,35 +601,37 @@ func (db *Olric) Start() error {
 		errCh <- db.server.ListenAndServe()
 	}()
 
+	// 等待 ListenAndServe 协程启动完成
 	<-db.server.StartCh
 	select {
+	// 启动出错，直接返回
 	case err := <-errCh:
 		return err
 	default:
 	}
+
 	// TCP server is started
 	db.passCheckpoint()
 
 	if err := db.startDiscovery(); err != nil {
 		return err
 	}
+
 	// Memberlist is started and this node joined the cluster.
 	db.passCheckpoint()
 
 	// Warn the user about its choice of configuration
 	if db.config.ReplicationMode == config.AsyncReplicationMode && db.config.WriteQuorum > 1 {
-		db.log.V(2).
-			Printf("[WARN] Olric is running in async replication mode. WriteQuorum (%d) is ineffective",
-				db.config.WriteQuorum)
+		db.log.V(2).Printf("[WARN] Olric is running in async replication mode. WriteQuorum (%d) is ineffective", db.config.WriteQuorum)
 	}
-
 	db.log.V(2).Printf("[INFO] Node name in the cluster: %s", db.name)
 
 	// Start periodic tasks.
 	db.wg.Add(2)
-	go db.updateRoutingPeriodically()
-	go db.evictKeysAtBackground()
+	go db.updateRoutingPeriodically() // 如果是 coordinator ，每分钟更新一次路由表
+	go db.evictKeysAtBackground()     //
 
+	// 启动成功回调
 	if db.started != nil {
 		db.wg.Add(1)
 		go db.callStartedCallback()

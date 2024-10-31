@@ -75,9 +75,11 @@ func testSingleReplicaConfig() *config.Config {
 }
 
 func newDB(c *config.Config, peers ...*Olric) (*Olric, error) {
+
 	if c == nil {
 		c = testConfig(peers)
 	}
+
 	if len(c.Peers) == 0 {
 		for _, peer := range peers {
 			c.Peers = append(c.Peers, peer.discovery.LocalNode().Address())

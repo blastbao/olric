@@ -143,6 +143,7 @@ func (c *Client) RequestTo(addr string, req protocol.EncodeDecoder) (protocol.En
 		var connErr error
 		if !(deadConn) {
 			// The conn returns to the pool
+			// 调用 close 会自动归还到 pool 中
 			connErr = conn.Close()
 		} else {
 			// marks the connection not usable any more, to let the pool close it instead of returning it to pool.

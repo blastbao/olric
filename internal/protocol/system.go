@@ -129,18 +129,23 @@ func (d *SystemMessage) Encode() error {
 	if d.extra != nil {
 		d.ExtraLen = uint8(binary.Size(d.extra))
 	}
+
+	// 不包含 header 部分的长度
 	d.MessageLength = SystemMessageHeaderSize + uint32(len(d.value)+int(d.ExtraLen))
 
+	// header
 	err := binary.Write(d.buf, binary.BigEndian, d.Header)
 	if err != nil {
 		return err
 	}
 
+	// sys header
 	err = binary.Write(d.buf, binary.BigEndian, d.SystemMessageHeader)
 	if err != nil {
 		return err
 	}
 
+	// extra
 	if d.extra != nil {
 		err = binary.Write(d.buf, binary.BigEndian, d.extra)
 		if err != nil {
@@ -148,6 +153,7 @@ func (d *SystemMessage) Encode() error {
 		}
 	}
 
+	// value
 	_, err = d.buf.Write(d.value)
 	return err
 }

@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+// 启动协程来进行键的淘汰。使用信号量控制并发淘汰工作线程的数量，根据 CPU 数量或配置的值来决定。
 func (db *Olric) evictKeysAtBackground() {
 	defer db.wg.Done()
 
@@ -58,6 +59,7 @@ func (db *Olric) evictKeysAtBackground() {
 	}
 }
 
+// 随机选择一个分区扫描
 func (db *Olric) evictKeys() {
 	partID := uint64(rand.Intn(int(db.config.PartitionCount)))
 	part := db.partitions[partID]
@@ -69,6 +71,25 @@ func (db *Olric) evictKeys() {
 	})
 }
 
+// 从 Redis 的文档中借鉴了策略：
+//   - 随机测试 20 个有过期时间的键。
+//   - 删除所有已过期的键。
+//   - 如果超过 25% 的键已过期，重复上述步骤。
+//
+// 策略控制:
+//
+//	maxKeyCount: 每次最多检查 20 个键。
+//	maxTotalCount: 总共最多处理 100 个键，防止 CPU 资源耗尽。
+//
+// janitor 函数：
+//   - 遍历 dmap 的存储，检查每个键。
+//   - 如果键过期或闲置，尝试删除。
+//   - 删除失败时记录错误日志，并继续尝试下一个键。
+//   - 统计删除的键数量。
+//
+// 循环控制：
+//   - 每次尝试最多检查 20 个键，如果删除的键数量超过 25%（即 5 个），继续执行 janitor 。
+//   - 如果总删除数量超过 100 个，停止扫描。
 func (db *Olric) scanDMapForEviction(partID uint64, name string, dm *dmap) {
 	/*
 		From Redis Docs:
@@ -103,8 +124,7 @@ func (db *Olric) scanDMapForEviction(partID uint64, name string, dm *dmap) {
 				err := db.delKeyVal(dm, hkey, name, vdata.Key)
 				if err != nil {
 					// It will be tried again.
-					db.log.V(3).Printf("[ERROR] Failed to delete expired hkey: %d on dmap: %s: %v",
-						hkey, name, err)
+					db.log.V(3).Printf("[ERROR] Failed to delete expired hkey: %d on dmap: %s: %v", hkey, name, err)
 					return true // this means 'continue'
 				}
 				count++
