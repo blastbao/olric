@@ -46,6 +46,17 @@ func (db *Olric) unmarshalValue(rawval []byte) (interface{}, error) {
 	return value, nil
 }
 
+// 函数 lookupOnOwners 在分区所有者及其之前的所有者中收集一个键/值对的所有版本。
+// 数据可能会被分配到不同的主机上（例如因分区重分配或复制策略变化时），函数会查找当前和以前的分区拥有者，以确保完整收集到该键的所有版本。
+//
+// 这个函数的主要目的是确保在分布式环境中，能够获取到某个键的所有可能版本，以便进行一致性检查或数据恢复。
+// 通过查询当前和之前的所有者，可以最大限度地收集到完整的数据历史。
+//
+// 步骤：
+//   - 本地主机检查: 首先在本地主机（当前分区所有者）上查找键值对。
+//   - 版本收集: 将找到的版本存储在 versions 列表中。
+//   - 查询前任所有者: 如果当前所有者没有找到，或者需要收集所有版本，则查询之前的分区所有者。
+//
 // lookupOnOwners collects versions of a key/value pair on the partition owner
 // by including previous partition owners.
 func (db *Olric) lookupOnOwners(dm *dmap, hkey uint64, name, key string) []*version {
@@ -58,9 +69,7 @@ func (db *Olric) lookupOnOwners(dm *dmap, hkey uint64, name, key string) []*vers
 		if err == storage.ErrKeyNotFound {
 			// the requested key can be found on a replica or a previous partition owner.
 			if db.log.V(5).Ok() {
-				db.log.V(5).Printf(
-					"[DEBUG] key: %s, HKey: %d on dmap: %s could not be found on the local storage: %v",
-					key, hkey, name, err)
+				db.log.V(5).Printf("[DEBUG] key: %s, HKey: %d on dmap: %s could not be found on the local storage: %v", key, hkey, name, err)
 			}
 		} else {
 			db.log.V(3).Printf("[ERROR] Failed to get key: %s on %s could not be found: %s", key, name, err)
@@ -101,15 +110,16 @@ func (db *Olric) lookupOnOwners(dm *dmap, hkey uint64, name, key string) []*vers
 					"previous primary owner: %s: %v", owner, err)
 			} else {
 				ver.data = &data
-				// Ignore failed owners. The data on those hosts will be wiped out
-				// by the rebalancer.
+				// Ignore failed owners. The data on those hosts will be wiped out by the rebalancer.
 				versions = append(versions, ver)
 			}
 		}
 	}
+
 	return versions
 }
 
+// 按照 Timestamp 降序排列，使得最新的版本位于切片的开头。
 func (db *Olric) sortVersions(versions []*version) []*version {
 	sort.Slice(versions,
 		func(i, j int) bool {
@@ -120,6 +130,7 @@ func (db *Olric) sortVersions(versions []*version) []*version {
 	return versions
 }
 
+// 清除数据为 nil 的版本，然后按照 Timestamp 排序
 func (db *Olric) sanitizeAndSortVersions(versions []*version) []*version {
 	var sanitized []*version
 	// We use versions slice for read-repair. Clear nil values first.
@@ -162,6 +173,11 @@ func (db *Olric) lookupOnReplicas(hkey uint64, name, key string) []*version {
 	return versions
 }
 
+// 函数 readRepair 用于在读取过程中修复不一致的数据版本，它确保集群中的所有副本都持有最新的、一致的数据。
+//
+// 遍历版本列表，跳过与最新版本（winner）时间戳相同的版本，因为这些版本已经是最新的，无需修复；
+// 构造请求消息，包含 winner 版本数据 <key,value,ttl(opt),timestamp>
+// 如果需要同步的旧版本是本地版本，就调用 localPut 来更新；如果是其他节点，就通过 rpc 发送 Put 请求；
 func (db *Olric) readRepair(name string, dm *dmap, winner *version, versions []*version) {
 	for _, ver := range versions {
 		if ver.data != nil && winner.data.Timestamp == ver.data.Timestamp {
@@ -177,7 +193,7 @@ func (db *Olric) readRepair(name string, dm *dmap, winner *version, versions []*
 			req.SetValue(winner.data.Value)
 			req.SetExtra(protocol.PutExtra{Timestamp: winner.data.Timestamp})
 		} else {
-			req := protocol.NewDMapMessage(protocol.OpPutExReplica)
+			req = protocol.NewDMapMessage(protocol.OpPutExReplica)
 			req.SetDMap(name)
 			req.SetKey(winner.data.Key)
 			req.SetValue(winner.data.Value)
@@ -213,10 +229,19 @@ func (db *Olric) readRepair(name string, dm *dmap, winner *version, versions []*
 }
 
 // [重要]
-//
-// !
-func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error) {
-	dm, err := db.getDMap(name, hkey)
+// 获取 dm 实例
+// 给 dm 加读锁，注意这里没有用 defer 解锁，因为在某些情况下需要在 readRepair 中调用 localPut ，而 localPut 需要写锁
+// 查找 table-key 在当前和之前拥有者上的所有版本
+// 如果 ReadQuorum 大于 0 ，则查找副本版本，并添加到版本列表中
+// 检查找到的版本数是否小于 ReadQuorum ，是则说明一致性不足，返回 ErrReadQuorum 错误
+// 清除 versions 中数据为 nil 的版本，然后按照 Timestamp 排序，若清理后为空，说明在所有分区拥有者和副本上都没有找到数据，返回 ErrKeyNotFound
+// 检查清理后版本数是否小于 ReadQuorum ，是则说明一致性不足，返回 ErrReadQuorum 错误
+// 选择排序后的第一个版本(最新版本)，检查数据是否过期或 key 为闲置键，如果是，报错返回 ErrKeyNotFound
+// 更新键的访问日志，便于维护数据的 LRU（最近最少使用）和 MaxIdleDuration（最大空闲持续时间）清理策略
+// 如果配置启用了读修复，调用 db.readRepair() 进行版本同步
+// 返回找到的最新版本的值
+func (db *Olric) callGetOnCluster(hkey uint64, table, key string) ([]byte, error) {
+	dm, err := db.getDMap(table, hkey)
 	if err != nil {
 		return nil, err
 	}
@@ -226,15 +251,16 @@ func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error)
 	// readRepair function may call localPut function which needs a write
 	// lock. Please don't forget calling RUnlock before returning here.
 
-	versions := db.lookupOnOwners(dm, hkey, name, key)
+	versions := db.lookupOnOwners(dm, hkey, table, key)
 	if db.config.ReadQuorum >= config.MinimumReplicaCount {
-		v := db.lookupOnReplicas(hkey, name, key)
+		v := db.lookupOnReplicas(hkey, table, key)
 		versions = append(versions, v...)
 	}
 	if len(versions) < db.config.ReadQuorum {
 		dm.RUnlock()
 		return nil, ErrReadQuorum
 	}
+
 	sorted := db.sanitizeAndSortVersions(versions)
 	if len(sorted) == 0 {
 		// We checked everywhere, it's not here.
@@ -252,6 +278,7 @@ func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error)
 		dm.RUnlock()
 		return nil, ErrKeyNotFound
 	}
+
 	// LRU and MaxIdleDuration eviction policies are only valid on
 	// the partition owner. Normally, we shouldn't need to retrieve the keys
 	// from the backup or the previous owners. When the fsck merge
@@ -263,14 +290,13 @@ func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error)
 	if db.config.ReadRepair {
 		// Parallel read operations may propagate different versions of
 		// the same key/value pair. The rule is simple: last write wins.
-		db.readRepair(name, dm, winner, versions)
+		db.readRepair(table, dm, winner, versions)
 	}
 	return winner.data.Value, nil
 }
 
 // 根据 name + key 的 hash % partCount 定位到 part ，找到 part owner；
-// 如果 owner 是本机，直接本地读取；
-// 否则，重定向请求到 owner 。
+// 如果 owner 是本机，直接本地读取；否则，重定向请求到 owner 。
 func (db *Olric) get(table, key string) ([]byte, error) {
 	member, hkey := db.findPartitionOwner(table, key)
 	// We are on the partition owner
@@ -311,6 +337,24 @@ func (db *Olric) exGetOperation(w, r protocol.EncodeDecoder) {
 	w.SetValue(value)
 }
 
+// 在 Olric 中，getBackupOperation 是用于处理备份节点上的读取操作的函数。
+//
+// 作用
+//   - 读取备份数据: 当主节点不可用或需要从备份节点读取数据时，getBackupOperation 会被调用。
+//   - 确保数据可用性: 在分布式系统中，数据通常会存储多个副本。getBackupOperation 允许从备份节点读取数据，从而提高系统的可用性和容错能力。
+//
+// 何时使用
+//   - 主节点故障: 如果主节点出现故障，系统可以从备份节点读取数据，以确保数据的可用性。
+//   - 负载均衡: 在某些情况下，可能会从备份节点读取数据以分散负载。
+//   - 数据一致性检查: 用于确保备份节点上的数据与主节点一致。
+//
+// 通过这种方式，Olric 提供了更高的容错能力和数据可用性，确保在各种故障情况下依然能够正常读取数据。
+//
+// 步骤
+//   - 解析请求：table 和 key
+//   - 取出备份数据表 dm
+//   - 从 dm 中读取 value ，判断是否过期
+//   - 将数据 value 序列化并返回
 func (db *Olric) getBackupOperation(w, r protocol.EncodeDecoder) {
 	req := r.(*protocol.DMapMessage)
 	hkey := db.getHKey(req.DMap(), req.Key())
@@ -340,6 +384,19 @@ func (db *Olric) getBackupOperation(w, r protocol.EncodeDecoder) {
 	w.SetValue(value)
 }
 
+// 在 Olric 中，getPrevOperation 是一种操作，用于从之前的分区所有者处获取数据。
+// 由于 Olric 是一个分布式内存缓存系统，分区的所有者可能会随着集群拓扑的改变而发生变化，例如在节点加入或离开集群时，分区的主节点可能会重新分配。
+// getPrevOperation 可以用来在这些变化期间，向之前的分区所有者查询数据，确保数据的一致性和可用性。
+//
+// 主要作用：
+//   - 访问旧分区所有者的数据：当数据无法在当前分区所有者上找到时，可以向旧的分区所有者发送 getPrevOperation 请求，以获取数据。
+//   - 支持数据迁移或恢复：当分区所有权发生变化时，如果新主节点暂时缺少数据，getPrevOperation 可以作为一种临时的解决方案，从旧节点获取所需数据。
+//   - 确保读一致性：在读取操作中，如果数据丢失或未找到，getPrevOperation 可以提供回退机制，确保即使在分区转移过程中，数据的读取请求也不会受到影响。
+//
+// 典型场景：
+//   - 分区重新分配期间的数据恢复：当一个节点加入或离开集群，导致分区重新分配时，新节点可能需要从旧分区所有者获取原有数据。在这种情况下，getPrevOperation 会被调用，以查询旧的分区所有者。
+//   - 读修复（Read Repair）过程：当一个数据请求因分区转移而无法从当前所有者找到数据时，可以通过 getPrevOperation 从先前的主节点查询数据。Olric 会通过这种方式尝试从旧分区所有者处获取最新版本的数据，来完成读修复。
+//   - 数据一致性检查：在分区变更期间，集群中的某些副本可能会尝试从旧主节点获取数据，以检查数据一致性，确保数据在新旧分区所有者之间的一致性。
 func (db *Olric) getPrevOperation(w, r protocol.EncodeDecoder) {
 	req := r.(*protocol.DMapMessage)
 	hkey := db.getHKey(req.DMap(), req.Key())

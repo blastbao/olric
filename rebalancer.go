@@ -39,6 +39,14 @@ type dmapbox struct {
 	AccessLog map[uint64]int64
 }
 
+// moveDMap 将分布式哈希表（dmap）从当前节点迁移到新的主节点（owner），主要用于分区重新平衡。
+// 在重新平衡过程中，需要将数据传输给新的分区主节点，以确保一致性。
+//
+// 锁表：确保在迁移期间 dmap 不会被其他操作修改。
+// 导出：将 dmap 中所有数据导出并序列化为便于传输的格式 payload 。
+// 封装请求：构建 dmapbox 结构体，包含分区 ID、备份标志、表名和表数据，如果 dmap 有缓存且包含访问日志，则添加访问日志到 dmapbox 中；
+// 发送请求：将 dmapbox 序列化后，塞到 `OpMoveDMap` 类型系统消息中，发送给新分区所有者 owner ；
+// 删除本地表：成功移动后，从当前分区中删除该 dmap 实例，以便 GC 释放内存。
 func (db *Olric) moveDMap(part *partition, name string, dm *dmap, owner discovery.Member) error {
 	dm.Lock()
 	defer dm.Unlock()
@@ -144,6 +152,29 @@ func (db *Olric) mergeDMaps(part *partition, data *dmapbox) error {
 	return mergeErr
 }
 
+// 此方法用于在 Olric 集群中重新平衡主分区（primary partitions）的数据，通常在集群的路由表发生更新后进行，例如节点加入或离开集群的情况下。
+// 其目标是将分区的所有权转移到新的主节点上，确保数据的平衡分布，保持集群的一致性。
+//
+// 方法逻辑
+//
+// 获取路由签名：
+//   - rsign 保存了当前的路由签名，用于标识当前的路由表状态，这个签名在路由表发生变化时会更新，帮助检测路由表是否已经变更。
+//
+// 遍历分区：
+//   - 检查服务器状态，若当前服务器已失效，则中止重新平衡。
+//   - 再次检查路由签名（可能在遍历过程中已经更新），如果 rsign 不再匹配当前的签名，则中止操作，因为路由表再次更新，留待下次再平衡。
+//
+// 分区数据转移：
+//   - 跳过空分区：如果分区为空（part.length() == 0），则直接跳过。
+//   - 检查分区所有权：通过 part.owner() 获取该分区的当前所有者节点。
+//     如果分区的当前所有者是本节点（通过 hostCmp 函数比较 owner 与 db.this），则无需操作，直接跳过。
+//     否则，这表示本节点是该分区的上一个所有者（“旧”所有者），因此需要将数据迁移给新的所有者节点。
+//
+// 迁移数据：如果分区存在新所有者，遍历本节点当前分区中存每个表(dmap），将数据迁移给新所有者：
+//   - 打印日志，记录该分区正在被迁移。
+//   - 调用 moveDMap 方法，将 dmap 中的数据移动到新的所有者节点上。
+//   - 如果迁移失败，则打印错误日志。
+//   - 每次迁移完毕，继续检查路由签名，若路由签名改变，则终止迁移操作，以防止继续基于过时的路由表状态进行数据迁移。
 func (db *Olric) rebalancePrimaryPartitions() {
 	rsign := atomic.LoadUint64(&routingSignature)
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {
@@ -151,7 +182,6 @@ func (db *Olric) rebalancePrimaryPartitions() {
 			// The server is gone.
 			break
 		}
-
 		if rsign != atomic.LoadUint64(&routingSignature) {
 			// Routing table is updated. Just quit. Another rebalancer goroutine will work on the
 			// new table immediately.
@@ -169,14 +199,12 @@ func (db *Olric) rebalancePrimaryPartitions() {
 			// Already belongs to me.
 			continue
 		}
+
 		// This is a previous owner. Move the keys.
 		part.m.Range(func(name, dm interface{}) bool {
-			db.log.V(2).Printf("[INFO] Moving dmap: %s (backup: %v) on PartID: %d to %s",
-				name, part.backup, partID, owner)
-			err := db.moveDMap(part, name.(string), dm.(*dmap), owner)
-			if err != nil {
-				db.log.V(2).Printf("[ERROR] Failed to move dmap: %s on PartID: %d to %s: %v",
-					name, partID, owner, err)
+			db.log.V(2).Printf("[INFO] Moving dmap: %s (backup: %v) on PartID: %d to %s", name, part.backup, partID, owner)
+			if err := db.moveDMap(part, name.(string), dm.(*dmap), owner); err != nil {
+				db.log.V(2).Printf("[ERROR] Failed to move dmap: %s on PartID: %d to %s: %v", name, partID, owner, err)
 			}
 			// if this returns true, the iteration continues
 			return rsign == atomic.LoadUint64(&routingSignature)
@@ -184,6 +212,35 @@ func (db *Olric) rebalancePrimaryPartitions() {
 	}
 }
 
+// 在分布式系统中，增加备份节点可以提升数据的可用性和容错性，但通常会有限制副本数目，以平衡数据可靠性和资源效率。
+// 配置副本数量是为了保证数据在指定数量的节点上冗余，以便在部分节点失效时系统仍能正常运行。
+// 不过，超过所需的备份数量会带来如下问题：
+//
+// 资源浪费：
+//
+//	每个备份节点都占用存储空间和网络资源。冗余备份过多会导致存储空间的浪费，特别是在数据量大的集群中显得不划算。
+//
+// 网络和计算负担增加：
+//
+//	过多的备份增加了数据同步和维护的开销，因为系统需要在每个数据更新时确保备份的一致性。
+//
+// 增加分布复杂度：
+//
+//	维护多余的备份节点会增加系统的管理复杂度，使得数据在节点间移动和分配更加复杂，影响集群性能。
+//
+// 示例说明
+//
+//	假设一个集群配置了 3 个备份节点，即 ReplicaCount = 3，这意味着数据应该有 1 个主节点和 2 个备份节点。
+//	如果集群发生重分区，某些数据可能暂时会有超过 2 个备份（例如，出现了 3 个或更多）。
+//	这种情况下，多余的备份节点就不再需要，可以通过迁移或清理恢复到期望的副本数量。
+//
+// 步骤:
+//   - 获取路由签名 rsign ，用于检测期间内是否发生了路由表更新。
+//   - 遍历所有备份分区
+//   - 检查当前节点存活状态，若当前节点已失效，则退出循环，不再进行任何重新平衡操作。
+//   - 判断分区是否为空，为空则跳过。
+//   - 检查备份数量：获取备份分区的所有拥有者节点列表，如果拥有者数量等于期望值 ReplicaCount - 1，则说明备份已满足，不需要迁移，继续下一个分区。
+//   - 如果存在多余的副本，则本节点上的备份则不再需要，可以迁移到这些多余副本的节点上，从而释放本地副本。
 func (db *Olric) rebalanceBackupPartitions() {
 	rsign := atomic.LoadUint64(&routingSignature)
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {
@@ -232,12 +289,9 @@ func (db *Olric) rebalanceBackupPartitions() {
 			}
 
 			part.m.Range(func(name, dm interface{}) bool {
-				db.log.V(2).Printf("[INFO] Moving dmap: %s (backup: %v) on PartID: %d to %s",
-					name, part.backup, partID, owner)
-				err := db.moveDMap(part, name.(string), dm.(*dmap), owner)
-				if err != nil {
-					db.log.V(2).Printf("[ERROR] Failed to move backup dmap: %s on PartID: %d to %s: %v",
-						name, partID, owner, err)
+				db.log.V(2).Printf("[INFO] Moving dmap: %s (backup: %v) on PartID: %d to %s", name, part.backup, partID, owner)
+				if err := db.moveDMap(part, name.(string), dm.(*dmap), owner); err != nil {
+					db.log.V(2).Printf("[ERROR] Failed to move backup dmap: %s on PartID: %d to %s: %v", name, partID, owner, err)
 				}
 				// if this returns true, the iteration continues
 				return rsign == atomic.LoadUint64(&routingSignature)
@@ -249,7 +303,6 @@ func (db *Olric) rebalanceBackupPartitions() {
 func (db *Olric) rebalancer() {
 	rebalanceMtx.Lock()
 	defer rebalanceMtx.Unlock()
-
 	if err := db.checkOperationStatus(); err != nil {
 		db.log.V(2).Printf("[WARN] Rebalancer awaits for bootstrapping")
 		return
@@ -271,16 +324,14 @@ func (db *Olric) checkOwnership(part *partition) bool {
 }
 
 func (db *Olric) moveDMapOperation(w, r protocol.EncodeDecoder) {
-	err := db.checkOperationStatus()
-	if err != nil {
+	if err := db.checkOperationStatus(); err != nil {
 		db.errorResponse(w, err)
 		return
 	}
 
 	req := r.(*protocol.SystemMessage)
 	box := &dmapbox{}
-	err = msgpack.Unmarshal(req.Value(), box)
-	if err != nil {
+	if err := msgpack.Unmarshal(req.Value(), box); err != nil {
 		db.log.V(2).Printf("[ERROR] Failed to unmarshal dmap: %v", err)
 		db.errorResponse(w, err)
 		return
@@ -292,21 +343,17 @@ func (db *Olric) moveDMapOperation(w, r protocol.EncodeDecoder) {
 	} else {
 		part = db.partitions[box.PartID]
 	}
+
 	// Check ownership before merging. This is useful to prevent data corruption in network partitioning case.
 	if !db.checkOwnership(part) {
-		db.log.V(2).Printf("[ERROR] Received dmap: %s on PartID: %d (backup: %v) doesn't belong to me",
-			box.Name, box.PartID, box.Backup)
-
+		db.log.V(2).Printf("[ERROR] Received dmap: %s on PartID: %d (backup: %v) doesn't belong to me", box.Name, box.PartID, box.Backup)
 		err := fmt.Errorf("partID: %d (backup: %v) doesn't belong to %s: %w", box.PartID, box.Backup, db.this, ErrInvalidArgument)
 		db.errorResponse(w, err)
 		return
 	}
 
-	db.log.V(2).Printf("[INFO] Received dmap (backup:%v): %s on PartID: %d",
-		box.Backup, box.Name, box.PartID)
-
-	err = db.mergeDMaps(part, box)
-	if err != nil {
+	db.log.V(2).Printf("[INFO] Received dmap (backup:%v): %s on PartID: %d", box.Backup, box.Name, box.PartID)
+	if err := db.mergeDMaps(part, box); err != nil {
 		db.log.V(2).Printf("[ERROR] Failed to merge dmap: %v", err)
 		db.errorResponse(w, err)
 		return

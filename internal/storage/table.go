@@ -20,28 +20,30 @@ import (
 	"github.com/pkg/errors"
 )
 
+// 最大键长度为 256 字节
 const maxKeyLen = 256
 
 var (
+	// 内存空间不足
 	errNotEnoughSpace = errors.New("not enough space")
-
 	// ErrKeyTooLarge is an error that indicates the given key is large than the determined key size.
 	// The current maximum key length is 256.
+	// 键长度超过最大限制
 	ErrKeyTooLarge = errors.New("key too large")
-
 	// ErrKeyNotFound is an error that indicates that the requested key could not be found in the DB.
+	// 键未找到
 	ErrKeyNotFound = errors.New("key not found")
 )
 
 type table struct {
-	hkeys  map[uint64]int
-	memory []byte
-	offset int
+	hkeys  map[uint64]int // 存储键哈希值到内存偏移量的映射
+	memory []byte         // 实际存储数据
+	offset int            // 当前内存使用的偏移量
 
 	// In bytes
-	allocated int
-	inuse     int
-	garbage   int
+	allocated int // 已分配的内存大小
+	inuse     int // 当前使用的内存大小
+	garbage   int // 标记为垃圾的内存大小
 }
 
 func newTable(size int) *table {
@@ -78,8 +80,22 @@ func (t *table) putRaw(hkey uint64, value []byte) error {
 }
 
 // In-memory layout for entry:
-//
 // KEY-LENGTH(uint8) | KEY(bytes) | TTL(uint64) | | Timestamp(uint64) | VALUE-LENGTH(uint32) | VALUE(bytes)
+//
+// 内存布局：
+//
+//	+------------+-----------+-----------+--------------+-----------------+--------------+
+//	| KEY-LENGTH |   KEY     |    TTL    |  Timestamp   | VALUE-LENGTH    |    VALUE     |
+//	|  (1 byte)  | (n bytes) | (8 bytes) |  (8 bytes)   |   (4 bytes)     |  (m bytes)   |
+//	+------------+-----------+-----------+--------------+-----------------+--------------+
+//
+// put 过程:
+//
+// 键长度检查: 如果键的长度超过 maxKeyLen（256 字节），返回 ErrKeyTooLarge 错误。
+// 内存空间检查: 如果所需空间超过已分配的内存，返回 errNotEnoughSpace 错误。
+// 删除已有键: 检查键是否已存在，如果存在，先删除旧数据。
+// 更新哈希映射和内存使用:
+// 如果成功存储，返回 nil。
 func (t *table) put(hkey uint64, value *VData) error {
 	if len(value.Key) >= maxKeyLen {
 		return ErrKeyTooLarge
@@ -212,6 +228,16 @@ func (t *table) get(hkey uint64) (*VData, bool) {
 	return vdata, false
 }
 
+// 功能
+// delete 方法用于从内存中删除指定的键值对，并更新相关的元数据。
+//
+// 步骤
+// 查找给定 hkey 的偏移量，如果找不到，返回 true ，表示键可能在前一个表中
+// 从 offset 开始，计算当前 hkey 对应 value 占用的空间，删除后这部分空间变为垃圾空间
+// 从 hkeys 中删除该键
+// 将删除的数据大小加到 garbage 中
+// 减少 inuse 的内存使用
+// 返回 false，表示成功删除
 func (t *table) delete(hkey uint64) bool {
 	offset, ok := t.hkeys[hkey]
 	if !ok {

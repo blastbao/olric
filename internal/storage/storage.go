@@ -23,6 +23,7 @@ import (
 )
 
 const (
+	// maxGarbageRatio 表示垃圾率的阈值，如果碎片达到 40% ，将创建新的表。
 	maxGarbageRatio = 0.40
 	// 65kb
 	minimumSize = 1 << 16
@@ -33,6 +34,7 @@ const (
 var ErrFragmented = errors.New("storage fragmented")
 
 // SlabInfo is used to expose internal data usage of a storage instance.
+// 记录内存分配和使用情况，包括已分配内存（Allocated）、已用内存（Inuse）和垃圾内存（Garbage）。
 type SlabInfo struct {
 	Allocated int
 	Inuse     int
@@ -40,6 +42,7 @@ type SlabInfo struct {
 }
 
 // VData represents a value with its metadata.
+// 封装 kv 数据以及元数据（TTL、时间戳等）
 type VData struct {
 	Key       string
 	Value     []byte
@@ -228,12 +231,16 @@ func (s *Storage) Delete(hkey uint64) error {
 	}
 
 	t := s.tables[0]
+
+	// 若存储中只剩一个表，需要检查该表的碎片率，如果碎片率达到 maxGarbageRatio（40%），即垃圾数据占总内存比例超过阈值，
+	// 则创建一个新表，并将其大小设为当前使用内存的两倍，并将新表添加到 tables 中。
 	if float64(t.allocated)*maxGarbageRatio <= float64(t.garbage) {
 		// Create a new table here.
 		nt := newTable(s.Inuse() * 2)
 		s.tables = append(s.tables, nt)
 		return ErrFragmented
 	}
+
 	return nil
 }
 
@@ -328,6 +335,7 @@ func (s *Storage) SlabInfo() SlabInfo {
 }
 
 // Inuse returns total in-use space by the tables.
+// 当前 table storage 中所有 kv 的总字节数
 func (s *Storage) Inuse() int {
 	// SlabInfo does the same thing but we need
 	// to eliminate useless calls.
@@ -339,6 +347,7 @@ func (s *Storage) Inuse() int {
 }
 
 // Check checks the key existence.
+// 检查 table storage 中是否存在 key
 func (s *Storage) Check(hkey uint64) bool {
 	if len(s.tables) == 0 {
 		panic("tables cannot be empty")
@@ -382,7 +391,9 @@ func (s *Storage) MatchOnKey(expr string, f func(hkey uint64, vdata *VData) bool
 	if len(s.tables) == 0 {
 		panic("tables cannot be empty")
 	}
-	r, err := regexp.Compile(expr)
+
+	// 正则表达式
+	reg, err := regexp.Compile(expr)
 	if err != nil {
 		return err
 	}
@@ -392,7 +403,7 @@ func (s *Storage) MatchOnKey(expr string, f func(hkey uint64, vdata *VData) bool
 		t := s.tables[i]
 		for hkey := range t.hkeys {
 			key, _ := t.getRawKey(hkey)
-			if !r.Match(key) {
+			if !reg.Match(key) {
 				continue
 			}
 			data, _ := t.get(hkey)

@@ -113,6 +113,8 @@ type EvictionPolicy string
 // because of that I preferred to define the types explicitly.
 
 // DMapCacheConfig denotes cache configuration for a particular dmap.
+//
+// 为特定的 DMap 配置缓存策略，以实现更精细的缓存管理。
 type DMapCacheConfig struct {
 	// MaxIdleDuration denotes maximum time for each entry to stay idle in the dmap.
 	// It limits the lifetime of the entries relative to the time of the last
@@ -146,35 +148,56 @@ type DMapCacheConfig struct {
 // DMapCacheConfig for a particular dmap. Don't set this if you use Olric as an ordinary key/value store.
 type CacheConfig struct {
 	// NumEvictionWorkers denotes the number of goroutines that's used to find keys for eviction.
+	// 用于执行键淘汰（Eviction）操作的 Goroutine 数量。
 	NumEvictionWorkers int64
+
 	// MaxIdleDuration denotes maximum time for each entry to stay idle in the dmap.
 	// It limits the lifetime of the entries relative to the time of the last
 	// read or write access performed on them. The entries whose idle period exceeds
 	// this limit are expired and evicted automatically. An entry is idle if no Get,
 	// Put, PutEx, Expire, PutIf, PutIfEx on it. Configuration of MaxIdleDuration
 	// feature varies by preferred deployment method.
+	//
+	// 如果某个键在一段时间内没有任何操作（如 Get, Put, PutEx, Expire, PutIf, PutIfEx 等），它会被标记为空闲并自动被移除。
 	MaxIdleDuration time.Duration
 
 	// TTLDuration is useful to set a default TTL for every key/value pair a dmap instance.
+	// 为每个键设置默认的 TTL（生存时间），TTL 到期后该键会被自动移除。
 	TTLDuration time.Duration
 
 	// MaxKeys denotes maximum key count on a particular node. So if you have 10 nodes with
 	// MaxKeys=100000, max key count in the cluster should around MaxKeys*10=1000000
+	//
+	// 设置每个节点上允许存储的最大键数量。
+	// 如果集群中有 10 个节点，且每个节点的 MaxKeys 设置为 100000，则整个集群的最大键数量大约为 MaxKeys * 10 = 1000000。
 	MaxKeys int
 
 	// MaxInuse denotes maximum amount of in-use memory on a particular node. So if you have 10 nodes with
 	// MaxInuse=100M (it has to be in bytes), max amount of in-use memory should be around MaxInuse*10=1G
+	//
+	// 指定每个节点上使用内存的最大字节数。
+	// 如果集群中有 10 个节点，每个节点的 MaxInuse 设置为 100M，则集群总共可以使用的最大内存大约为 MaxInuse * 10 = 1G。
+	// 一旦达到内存上限，节点将自动开始淘汰部分数据，以释放内存。
 	MaxInuse int
 
 	// LRUSamples denotes amount of randomly selected key count by the aproximate LRU implementation.
 	// Lower values are better for high performance. It's 5 by default.
+	//
+	// 指定 LRU 实现中每次随机选择的键数量。
+	// 使用近似 LRU 实现（基于随机采样）来选择要淘汰的键，较低的采样数值能提升性能。默认值为 5 。
 	LRUSamples int
 
 	// EvictionPolicy determines the eviction policy in use. It's NONE by default.
 	// Set as LRU to enable LRU eviction policy.
+	//
+	// 设置使用的淘汰策略。
+	// 默认是 NONE，表示没有启用任何淘汰策略。
+	// 可以设置为 LRU，启用基于最近最少使用（Least Recently Used）的淘汰策略。
 	EvictionPolicy EvictionPolicy
 
 	// DMapConfigs is useful to set custom cache config per dmap instance.
+	//
+	// 用于为特定的 DMap 实例配置自定义缓存设置，例如某些 DMap 可能需要不同的 TTL 或淘汰策略等。
 	DMapConfigs map[string]DMapCacheConfig
 }
 
@@ -280,6 +303,7 @@ type Config struct {
 	// 不能同时指定 LogOutput 和 Logger。
 	Logger *log.Logger
 
+	//
 	Cache *CacheConfig
 
 	// Minimum size(in-bytes) for append-only file

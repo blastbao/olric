@@ -35,6 +35,11 @@ type cache struct {
 	evictionPolicy  config.EvictionPolicy
 }
 
+// 创建空的缓存配置对象
+// 应用全局缓存配置
+// 应用特定 DMap 的缓存配置
+// [重要] 如果使用了 LRU 淘汰策略或者设置了 maxIdleDuration，则为该 DMap 实例创建 accessLog ，因为 LRU 和 MaxIdleDuration 都需要跟踪键的访问时间。
+// [重要] 如果启用了 LRU 策略，会检查 maxInuse 和 maxKeys 是否大于零，因为 LRU 策略至少需要其中一个限制条件。如果没有指定 lruSamples（近似 LRU 策略所需的随机采样键数），则将其设置为默认值 DefaultLRUSamples。
 func (db *Olric) setCacheConfiguration(dm *dmap, name string) error {
 	// Try to set cache configuration for this dmap.
 	dm.cache = &cache{}

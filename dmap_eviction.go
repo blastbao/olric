@@ -155,6 +155,7 @@ func (db *Olric) scanDMapForEviction(partID uint64, name string, dm *dmap) {
 	}
 }
 
+// 更新 hkey 的最近访问时间
 func (dm *dmap) updateAccessLog(hkey uint64) {
 	if dm.cache == nil || dm.cache.accessLog == nil {
 		// Fail early. This's useful to avoid checking the configuration everywhere.

@@ -537,8 +537,6 @@ func (db *Olric) isAlive() bool {
 // It has to be very fast for a smooth operation.
 //
 // 检查当前节点是否已经完成引导，若没完成则进入循环等待，每 100 毫秒检查一次，直到完成引导或者节点退出。
-//
-
 func (db *Olric) checkBootstrap() error {
 	// check it immediately
 	if atomic.LoadInt32(&db.bootstrapped) == 1 {
@@ -585,8 +583,7 @@ func (db *Olric) checkMemberCountQuorum() error {
 }
 
 // checkOperationStatus controls bootstrapping status and cluster quorum to prevent split-brain syndrome.
-//
-// 检查当前集群中的成员数量是否满足配置要求的法定节点数（Quorum）。
+// 检查当前集群中的成员数量是否满足配置要求的法定节点数（Quorum） && 检查当前节点是否已经完成引导；
 func (db *Olric) checkOperationStatus() error {
 	if err := db.checkMemberCountQuorum(); err != nil {
 		return err

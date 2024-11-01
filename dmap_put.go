@@ -315,8 +315,13 @@ func (db *Olric) put(w *writeop) error {
 	return err
 }
 
-func (db *Olric) prepareWriteop(opcode protocol.OpCode, name, key string,
-	value interface{}, timeout time.Duration, flags int16) (*writeop, error) {
+func (db *Olric) prepareWriteop(
+	opcode protocol.OpCode,
+	name, key string,
+	value interface{},
+	timeout time.Duration,
+	flags int16) (*writeop, error) {
+
 	val, err := db.serializer.Marshal(value)
 	if err != nil {
 		return nil, err
@@ -437,6 +442,7 @@ func (db *Olric) putReplicaOperation(w, r protocol.EncodeDecoder) {
 	w.SetStatus(protocol.StatusOK)
 }
 
+// 执行表压缩，减少碎片和提高效率
 func (db *Olric) compactTables(dm *dmap) {
 	defer db.wg.Done()
 	for {
