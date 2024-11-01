@@ -202,9 +202,31 @@ func (d *Discovery) dialDeadMember(member string) {
 	}
 }
 
+// 当节点 leave 时，可能是假离线或者很快就恢复，应该给一个重新试探的机会，来确保它确实是离开了。
+// 所以，当收到 NodeLeave 消息时，先暂时记录下来，后面定时检查是否真的离线，如果还在线要重新加回来。
+//
+// 分支一：
+//
+//	当收到 NodeLeave 事件时，将 member 加入到 deadMembers{} 中；
+//	当收到 NodeJoin 事件时，将 member 从 deadMembers{} 中移除；
+//
+// 分支二：
+//
+//	每秒钟从 deadMembers{} 中随机取一个 deadMember 来 ping ，如果成功则 rejoin 否则从 deadMembers 中删除；
+//
+// 备注：
+//
+// 事件 NodeLeave 通常在集群中的某个节点主动离开或与集群失联时触发。
+//
+// ## 节点主动退出 ##
+// 当集群中的一个节点主动调用 memberlist.Leave() 方法时，该节点会向集群中的其他节点广播它即将离开的消息。
+// 其他节点在接收到这个广播消息后，会触发 NodeLeave 事件，表示该节点已主动退出集群。
+//
+// ## 节点意外失联 ##
+// 如果某个节点意外断开连接，例如网络故障、节点崩溃、服务器关机等，集群中的其他节点在一定的超时时间后会认为该节点失联。
+// 在失联超时后，memberlist 会触发 NodeLeave 事件来通知其他节点，这个失联的节点已不再是集群的一部分。
 func (d *Discovery) deadMemberTracker() {
 	d.wg.Done()
-
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -216,8 +238,7 @@ func (d *Discovery) deadMemberTracker() {
 			} else if e.Event == memberlist.NodeLeave {
 				d.deadMembers[member] = time.Now().UnixNano()
 			} else {
-				d.log.V(2).Printf("[ERROR] Unknown memberlist event received for: %s: %v",
-					e.NodeName, e.Event)
+				d.log.V(2).Printf("[ERROR] Unknown memberlist event received for: %s: %v", e.NodeName, e.Event)
 			}
 		case <-time.After(time.Second):
 			// 每秒钟尝试连接一个 dead member
@@ -279,6 +300,17 @@ func (d *Discovery) Start() error {
 // by contacting all the given hosts and performing a state sync. Initially,
 // the Memberlist only contains our own state, so doing this will cause remote
 // nodes to become aware of the existence of this node, effectively joining the cluster.
+//
+// Join 通过联系其他集群节点，进行状态同步，使其他节点知晓当前节点的存在，从而完成加入集群的操作。
+// 如果加入集群成功，成功返回加入的节点数量，失败则报错。
+//
+// 如果 d.serviceDiscovery 存在，调用 DiscoverPeers() 方法来发现其他可用节点的地址列表。
+// d.serviceDiscovery 是一个接口或对象，用于动态发现集群中的其他节点。
+//
+// 如果成功获取到其他节点 peers，调用 d.memberlist.Join(peers) 将当前节点加入这些节点所在的集群。
+// Join 方法会尝试联系 peers 中的所有节点，并进行状态同步，使得它们能够知晓当前节点的加入。
+//
+// 如果 d.serviceDiscovery 不存在，则尝试使用 d.config.Peers 中定义的节点列表来加入集群。
 func (d *Discovery) Join() (int, error) {
 	if d.serviceDiscovery != nil {
 		peers, err := d.serviceDiscovery.DiscoverPeers()

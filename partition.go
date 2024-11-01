@@ -28,7 +28,7 @@ type partition struct {
 
 	id     uint64
 	backup bool
-	m      sync.Map
+	m      sync.Map // name => *data_map
 	owners atomic.Value
 }
 
@@ -116,5 +116,6 @@ func (db *Olric) getHKey(name, key string) uint64 {
 // findPartitionOwner finds the partition owner for a key on a dmap.
 func (db *Olric) findPartitionOwner(name, key string) (discovery.Member, uint64) {
 	hkey := db.getHKey(name, key)
-	return db.getPartition(hkey).owner(), hkey
+	part := db.getPartition(hkey)
+	return part.owner(), hkey
 }

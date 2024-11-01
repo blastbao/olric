@@ -297,9 +297,19 @@ func (db *Olric) bootstrapCoordinator() error {
 
 // startDiscovery initializes and starts discovery subsystem.
 //
-// 从 ml 中获取自己对应的 node 并保存
+// 创建 discovery 对象并启动；
+// 尝试将当前节点加入到 ml 集群中，若失败则重试(最多 N 次)；
+// 完成 join 之后(可能失败)，从 discovery 中获取当前节点，若无法获取则报错返回；
+// 获取当前 ml 集群成员的数量存储到 db.numMembers 中，以加速获取；
+// [重要]启动协程，从 d.ClusterEvents 管道中监听 ml 事件，更新本地路由信息；
+// 节点启动时，无法短时发现集群中所有成员，集群中节点数可能不满足 Quorum ，这时不能做任何操作，所以要阻塞等待；
+// 集群中节点数达到要求 Quorum，可以继续执行：
+//   - 把自己加入到活跃成员列表
+//   - 把自己加入到一致性哈希环
+//   - 如果当前节点是 coordinator ，需要执行 bootstrap 操作
+//
+// 启动完毕，信息打印
 func (db *Olric) startDiscovery() error {
-
 	d, err := discovery.New(db.log, db.config)
 	if err != nil {
 		return err
@@ -372,13 +382,10 @@ func (db *Olric) startDiscovery() error {
 
 	// 至此，集群中节点数达到要求 Quorum，可以继续执行
 
-	// 把自己加入到活跃成员列表
 	db.members.mtx.Lock()
 	db.members.m[db.this.ID] = db.this
 	db.members.mtx.Unlock()
-	// 把字节加入到一致性哈希环
 	db.consistent.Add(db.this)
-	// 如果当前节点是 coordinator ，需要执行 bootstrap 操作
 	if db.discovery.IsCoordinator() {
 		err = db.bootstrapCoordinator()
 		if err == consistent.ErrInsufficientMemberCount {
@@ -391,7 +398,6 @@ func (db *Olric) startDiscovery() error {
 		}
 	}
 
-	// 信息打印
 	if db.config.Interface != "" {
 		db.log.V(2).Printf("[INFO] Olric uses interface: %s", db.config.Interface)
 	}
@@ -407,10 +413,10 @@ func (db *Olric) startDiscovery() error {
 // callStartedCallback checks passed checkpoint count and calls the callback function.
 func (db *Olric) callStartedCallback() {
 	defer db.wg.Done()
-
 	for {
 		select {
 		case <-time.After(10 * time.Millisecond):
+			// 当通过两个检查点之后，才能执行 started 回调
 			if requiredCheckpoints == atomic.LoadInt32(&db.passedCheckpoints) {
 				if db.started != nil {
 					db.started()
@@ -593,7 +599,7 @@ func (db *Olric) checkOperationStatus() error {
 // Start function returns an early error.
 func (db *Olric) Start() error {
 
-	// 启动 ListenAndServe 协程：接收连接处理请求
+	// 启动 ListenAndServe 协程：负责接收连接、处理请求、写回响应
 	errCh := make(chan error, 1)
 	db.wg.Add(1)
 	go func() {
@@ -601,23 +607,25 @@ func (db *Olric) Start() error {
 		errCh <- db.server.ListenAndServe()
 	}()
 
-	// 等待 ListenAndServe 协程启动完成
+	// 等待 ListenAndServe 协程启动完毕或失败
 	<-db.server.StartCh
 	select {
-	// 启动出错，直接返回
 	case err := <-errCh:
 		return err
 	default:
 	}
 
 	// TCP server is started
+	// 检查点 1
 	db.passCheckpoint()
 
+	// 启动服务发现，用于初始化 ml 集群、维护路由表、处理成员变更事件；
 	if err := db.startDiscovery(); err != nil {
 		return err
 	}
 
 	// Memberlist is started and this node joined the cluster.
+	// 检查点 2
 	db.passCheckpoint()
 
 	// Warn the user about its choice of configuration
@@ -628,7 +636,7 @@ func (db *Olric) Start() error {
 
 	// Start periodic tasks.
 	db.wg.Add(2)
-	go db.updateRoutingPeriodically() // 如果是 coordinator ，每分钟更新一次路由表
+	go db.updateRoutingPeriodically() // 如果是 coordinator ，每分钟更新一次路由表并广播到 ml 集群
 	go db.evictKeysAtBackground()     //
 
 	// 启动成功回调

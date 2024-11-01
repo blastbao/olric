@@ -182,7 +182,7 @@ func (s *Server) processMessage(conn io.ReadWriteCloser, connStatus *uint32, don
 	resp := req.Response(nil) // 重置内部 buf ，因为已经解码了，这个 buf 用不到了，用于后续写 resp
 
 	// The dispatcher is defined by olric package and responsible to evaluate the incoming message.
-	// 执行请求
+	// [重要] 执行请求
 	s.dispatcher(resp, req)
 
 	// 编码响应

@@ -59,7 +59,7 @@ func (db *Olric) evictKeysAtBackground() {
 	}
 }
 
-// 随机选择一个分区扫描
+// 随机选择一个分区
 func (db *Olric) evictKeys() {
 	partID := uint64(rand.Intn(int(db.config.PartitionCount)))
 	part := db.partitions[partID]

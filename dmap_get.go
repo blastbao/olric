@@ -39,6 +39,7 @@ func (db *Olric) unmarshalValue(rawval []byte) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 对空值的特殊处理(把 struct{} 序列化存储)，标识数据不存在
 	if _, ok := value.(struct{}); ok {
 		return nil, nil
 	}
@@ -211,11 +212,15 @@ func (db *Olric) readRepair(name string, dm *dmap, winner *version, versions []*
 	}
 }
 
+// [重要]
+//
+// !
 func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error) {
 	dm, err := db.getDMap(name, hkey)
 	if err != nil {
 		return nil, err
 	}
+
 	dm.RLock()
 	// RUnlock should not be called with defer statement here because
 	// readRepair function may call localPut function which needs a write
@@ -263,16 +268,18 @@ func (db *Olric) callGetOnCluster(hkey uint64, name, key string) ([]byte, error)
 	return winner.data.Value, nil
 }
 
-func (db *Olric) get(name, key string) ([]byte, error) {
-	member, hkey := db.findPartitionOwner(name, key)
+// 根据 name + key 的 hash % partCount 定位到 part ，找到 part owner；
+// 如果 owner 是本机，直接本地读取；
+// 否则，重定向请求到 owner 。
+func (db *Olric) get(table, key string) ([]byte, error) {
+	member, hkey := db.findPartitionOwner(table, key)
 	// We are on the partition owner
 	if hostCmp(member, db.this) {
-		return db.callGetOnCluster(hkey, name, key)
+		return db.callGetOnCluster(hkey, table, key)
 	}
-
 	// Redirect to the partition owner
 	req := protocol.NewDMapMessage(protocol.OpGet)
-	req.SetDMap(name)
+	req.SetDMap(table)
 	req.SetKey(key)
 	resp, err := db.requestTo(member.String(), req)
 	if err != nil {
