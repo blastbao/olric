@@ -232,9 +232,9 @@ func (db *Olric) readRepair(name string, dm *dmap, winner *version, versions []*
 // 获取 dm 实例
 // 给 dm 加读锁，注意这里没有用 defer 解锁，因为在某些情况下需要在 readRepair 中调用 localPut ，而 localPut 需要写锁
 // 查找 table-key 在当前和之前拥有者上的所有版本
-// 如果 ReadQuorum 大于 0 ，则查找副本版本，并添加到版本列表中
+// 如果 ReadQuorum 大于 0 ，则查找备份版本，并添加到版本列表中
 // 检查找到的版本数是否小于 ReadQuorum ，是则说明一致性不足，返回 ErrReadQuorum 错误
-// 清除 versions 中数据为 nil 的版本，然后按照 Timestamp 排序，若清理后为空，说明在所有分区拥有者和副本上都没有找到数据，返回 ErrKeyNotFound
+// 清除 versions 中数据为 nil 的版本，然后按照 Timestamp 排序，若清理后为空，说明在所有分区拥有者和备份上都没有找到数据，返回 ErrKeyNotFound
 // 检查清理后版本数是否小于 ReadQuorum ，是则说明一致性不足，返回 ErrReadQuorum 错误
 // 选择排序后的第一个版本(最新版本)，检查数据是否过期或 key 为闲置键，如果是，报错返回 ErrKeyNotFound
 // 更新键的访问日志，便于维护数据的 LRU（最近最少使用）和 MaxIdleDuration（最大空闲持续时间）清理策略

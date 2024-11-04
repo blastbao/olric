@@ -175,6 +175,10 @@ func (db *Olric) mergeDMaps(part *partition, data *dmapbox) error {
 //   - 调用 moveDMap 方法，将 dmap 中的数据移动到新的所有者节点上。
 //   - 如果迁移失败，则打印错误日志。
 //   - 每次迁移完毕，继续检查路由签名，若路由签名改变，则终止迁移操作，以防止继续基于过时的路由表状态进行数据迁移。
+//
+// 备注：
+//   - rebalance 是由 coordinator 发起的，但是每个 node 都会执行 rebalance ；
+//   - rebalance 过程中，发现分区 part-x 出现新的所有者，那么每个拥有 part-x 的旧所有者要把数据拷贝给新所有者；
 func (db *Olric) rebalancePrimaryPartitions() {
 	rsign := atomic.LoadUint64(&routingSignature)
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {

@@ -41,6 +41,16 @@ type route struct {
 
 type routingTable map[uint64]route
 
+// getReplicaOwners 它通过一致性哈希（consistent）算法找到分区最近的 N 个节点作为副本节点，
+// 这些 “最近的 N 个节点” 既可以是主节点也可以是备份节点，通常第一个作为主节点，其余作为备份节点。
+//
+// 一致性哈希的基本原理
+//   - 哈希环：
+//     一致性哈希算法将所有节点和数据分区映射到一个固定大小的哈希空间（通常表现为一个环形的哈希环）。
+//     每个节点被哈希到一个或多个位置上，而每个分区也映射到哈希环的某个位置。
+//   - 最近节点分配：
+//     数据或分区映射到环上后，通常将数据指派给离其位置最近的节点。
+//     例如，数据分区在顺时针方向上会找到第一个节点作为“所有者”，以便读写操作可以路由到该节点。
 func (db *Olric) getReplicaOwners(partID uint64) ([]consistent.Member, error) {
 	for i := db.config.ReplicaCount; i > 0; i-- {
 		newOwners, err := db.consistent.GetClosestNForPartition(int(partID), i)
@@ -56,6 +66,15 @@ func (db *Olric) getReplicaOwners(partID uint64) ([]consistent.Member, error) {
 	return nil, consistent.ErrInsufficientMemberCount
 }
 
+// 管理和更新分区的备份副本节点列表，以确保备份分布在可用且最新的节点上，同时移除失效或不再包含有效数据的节点。
+//
+// 步骤：
+// - 获取当前备份节点列表：获取当前分区 partID 的所有者列表，并创建其副本以避免直接修改。
+// - 获取新的备份节点列表：调用 getReplicaOwners 方法获取分区 partID 新的副本列表，移除其中的主所有者（即 newOwners[0]），因为该函数只关注备份所有者。
+// - 如果分区没有备份所有者，直接将新的备份所有者添加到列表中并返回。
+// - 移除失效节点：每个备份节点 backup 是否仍存在于集群，且身份信息未发生变更。
+// - 移除空节点：检查备份节点上的数据是否为空。
+// - 添加新的备份节点：将每个新的备份节点添加到 owners ，如果已经存在则移动到末尾，否则直接 append 。
 func (db *Olric) distributeBackups(partID uint64) []discovery.Member {
 	part := db.backups[partID]
 	owners := make([]discovery.Member, part.ownerCount())
@@ -151,11 +170,18 @@ func (db *Olric) distributeBackups(partID uint64) []discovery.Member {
 	return owners
 }
 
+// [重要]
+//
+// 更新分区的主副本拥有者列表，以确保数据的主副本在合适的节点上，并移除失效或空的节点。
+// 1. 获取分区拥有者列表：从当前分区 part 的 owners 拷贝出一份副本。这样可以在不修改原始列表的情况下，对分区拥有者列表进行筛选和调整。
+// 2. 获取新的分区主副本节点：使用一致性哈希算法找到新的分区所有者，通过 GetPartitionOwner 获取 partID 分区的新的主副本节点 newOwner 。
+// 3. 首次分配：如果 owners 为空（即没有任何主副本拥有者），则将 newOwner 直接添加到 owners 中并返回。
+// 4. 移除失效节点：循环遍历 owners，检查节点的有效性并移除失效的节点；indMemberByName 会通过 discovery 模块查找当前 owner 的节点是否存在于集群中。
+// 5. 移除空节点：对每个 owner 发送 OpLengthOfPart 请求，获取该 partID 分区上键值对数量。如果分区为空 (count == 0)，说明该节点对该分区不再持有数据，将其从 owners 列表中移除。
+// 6. 将新的主副本节点加入 owners ：如果 newOwner 已经在 owners 中，将其移动到列表末尾，当作最新主节点，否则直接 append 。
+// 7. 返回最新的主副本节点列表。
 func (db *Olric) distributePrimaryCopies(partID uint64) []discovery.Member {
-
 	// First you need to create a copy of the owners list. Don't modify the current list.
-	//
-	//
 	part := db.partitions[partID]
 	owners := make([]discovery.Member, part.ownerCount())
 	copy(owners, part.loadOwners())
@@ -231,10 +257,10 @@ func (db *Olric) distributePrimaryCopies(partID uint64) []discovery.Member {
 // 构造空路由表
 //
 // 遍历分区，逐个分区填充其路由表项
-//   - 获取当前分区的路由表项
+//   - 获取分区路由
 //   - 设置主副本
 //   - 设置备份副本(如果指定需要备份副本)
-//   - 更新路由表项
+//   - 更新分区路由
 //
 // 返回已填充路由表
 func (db *Olric) distributePartitions() routingTable {
@@ -250,7 +276,7 @@ func (db *Olric) distributePartitions() routingTable {
 	return table
 }
 
-// 将路由表 table 序列化，以便 rpc 集群发送
+// 将路由表 table 序列化，以便通过 rpc 向集群各节点发送
 // 构造 UpdateRouting 系统消息，并行发送给集群中各个节点，由信号量 sem 控制并行度不超过系统核数
 // 逐个接收集群中各个节点返回的响应 `ownershipReport` ，其包含了该节点上有效的分区列表
 // 汇总各个节点的 ownershipReports 并返回
@@ -306,9 +332,9 @@ func (db *Olric) updateRoutingTableOnCluster(table routingTable) (map[discovery.
 // 检查当前节点是否为集群的协调员，更新路由表只能由 coordinator 负责
 // 检查集群节点数量是否满足 Quorum 要求，如果不满足则不能更新路由表
 // 路由更新操作无法并行，加锁保护
-// 计算每个分区的主副本和备份副本，生成最新路由表
+// [重要] 计算每个分区的主副本和备份副本，生成最新路由表
 // 将新路由表分发到集群中的所有节点，并将各节点返回的 report 汇总起来，report 包含该节点上有效的分区列表
-// 根据各节点上的分区信息更新本地路由表，确保 coordinator 包含最新最完整的分区路由信息，下次会继续广播给集群
+// [重要] 根据各节点上的分区信息更新本地路由表，确保 coordinator 包含最新最完整的分区路由信息，下次会继续广播给集群
 func (db *Olric) updateRouting() {
 	// This function is only run by the cluster coordinator.
 	if !db.discovery.IsCoordinator() {
@@ -432,6 +458,9 @@ func (db *Olric) processNodeEvent(event *discovery.ClusterEvent) {
 }
 
 // 监听 ml 事件，执行对应逻辑
+//
+// 备注：
+//   - 只要发生 ml 事件，就意味着路由表更新，coordinator 接收到之后会广播路由变更消息
 func (db *Olric) listenMemberlistEvents(eventCh chan *discovery.ClusterEvent) {
 	defer db.wg.Done()
 	for {
@@ -569,7 +598,7 @@ type ownershipReport struct {
 	Backups    []uint64
 }
 
-// 遍历每个 part ，如果其主分区非空，就将 PartID 存入 res.Partitions ，同理备份分区；
+// 遍历每个 part ，如果当前节点中其主分区非空，就将 PartID 存入 res.Partitions ，同理备份分区；
 func (db *Olric) prepareOwnershipReport() ([]byte, error) {
 	res := ownershipReport{}
 	for partID := uint64(0); partID < db.config.PartitionCount; partID++ {

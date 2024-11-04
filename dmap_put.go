@@ -151,6 +151,12 @@ func (db *Olric) localPut(hkey uint64, dm *dmap, w *writeop) error {
 	return err
 }
 
+// 在集群上执行异步写操作，将数据写入本地节点后，将备份异步发送到其他集群节点，不等待备份节点的响应。
+//
+// 创建请求
+// 获取备份分区所有者
+// 异步复制备份数据
+// 本地写入
 func (db *Olric) asyncPutOnCluster(hkey uint64, dm *dmap, w *writeop) error {
 	req := w.toReq(w.replicaOpcode)
 	// Fire and forget mode.
@@ -170,6 +176,15 @@ func (db *Olric) asyncPutOnCluster(hkey uint64, dm *dmap, w *writeop) error {
 	return db.localPut(hkey, dm, w)
 }
 
+// 在集群上执行同步写操作，它通过使用一致性写入策略（多数投票或法定人数即 Quorum）确保数据被成功复制到多个节点。
+// 同步模式在收到指定数量的成功响应后才确认写入，提供了更高的一致性。
+//
+// 创建请求
+// 初始化计数器 successful ，用于记录成功完成写入的节点数量。
+// 获取此键的备份节点列表，即负责存储备份数据的其他集群节点。
+// 遍历备份节点并执行同步写入，若成功则增加 successful 计数器。
+// 本地节点写入，若成功则增加 successful 计数器。
+// 检查写入的法定人数（Quorum），若成功节点数达到或超过法定人数，方法返回 nil 表示写入成功，否则返回 ErrWriteQuorum 表示写入失败。
 func (db *Olric) syncPutOnCluster(hkey uint64, dm *dmap, w *writeop) error {
 	req := w.toReq(w.replicaOpcode)
 
@@ -200,6 +215,29 @@ func (db *Olric) syncPutOnCluster(hkey uint64, dm *dmap, w *writeop) error {
 	return ErrWriteQuorum
 }
 
+// 步骤:
+//
+// 获取和锁定 DMap:
+//   - 通过 getDMap 函数获取指定的 DMap，并对其加锁，以确保线程安全。
+//
+// 条件写入检查:
+//   - 如果不存在则设置 (IfNotFound 标志): 仅在键不存在或已过期时写入；否则返回 ErrKeyFound 。
+//   - 如果存在则设置 (IfFound 标志): 仅在键存在（且未过期）时写入；否则返回 ErrKeyNotFound 。
+//
+// LRU 驱逐策略: 若启用了 LRU 驱逐策略，则在插入新项前检查 maxKeys 和 maxInuse 配置，并根据需要逐出旧项。
+//   - maxKeys：限制单个节点上管理的最大键数，考虑到分区数量。
+//   - maxInuse：限制单个节点上分区使用的内存量，若超出则触发逐出。
+//   - evictKeyWithLRU 方法会在 LRU 策略下删除最不常用的键。
+//
+// TTL 设置:
+//   - 若 DMap 对象设置了默认 TTL 而当前写入操作未指定超时时间，则将 TTL 设置为 DMap 的默认值。
+//
+// 本地写入:
+//   - 若副本数量为 MinimumReplicaCount（即仅为单副本），则直接调用 localPut 方法完成本地写入，无需额外复制。
+//
+// 集群写入: 根据 ReplicationMode 配置的复制模式进行写入
+//   - 异步复制：使用 asyncPutOnCluster 进行异步复制，数据将在集群节点上以并发方式写入，无需等待响应。
+//   - 同步复制：通过 syncPutOnCluster 进行基于 Quorum 的同步写入，确保数据成功写入大部分副本节点。
 func (db *Olric) callPutOnCluster(hkey uint64, w *writeop) error {
 	// Get the dmap and acquire its lock
 	dm, err := db.getDMap(w.dmap, hkey)
@@ -283,13 +321,11 @@ func (db *Olric) callPutOnCluster(hkey uint64, w *writeop) error {
 	if dm.cache != nil && dm.cache.ttlDuration.Seconds() != 0 && w.timeout.Seconds() == 0 {
 		w.timeout = dm.cache.ttlDuration
 	}
-
 	if db.config.ReplicaCount == config.MinimumReplicaCount {
 		// MinimumReplicaCount is 1. So it's enough to put the key locally. There is no
 		// other replica host.
 		return db.localPut(hkey, dm, w)
 	}
-
 	if db.config.ReplicationMode == config.AsyncReplicationMode {
 		// Fire and forget mode. Calls PutBackup command in different goroutines
 		// and stores the key/value pair on local storage instance.
@@ -303,6 +339,8 @@ func (db *Olric) callPutOnCluster(hkey uint64, w *writeop) error {
 
 // put controls every write operation in Olric. It redirects the requests to its owner,
 // if the key belongs to another host.
+//
+// 如果数据的实际归属节点是当前节点，它会直接执行写入操作；否则，它将请求重定向到正确的节点。
 func (db *Olric) put(w *writeop) error {
 	member, hkey := db.findPartitionOwner(w.dmap, w.key)
 	if hostCmp(member, db.this) {
@@ -317,7 +355,8 @@ func (db *Olric) put(w *writeop) error {
 
 func (db *Olric) prepareWriteop(
 	opcode protocol.OpCode,
-	name, key string,
+	table string,
+	key string,
 	value interface{},
 	timeout time.Duration,
 	flags int16) (*writeop, error) {
@@ -328,7 +367,7 @@ func (db *Olric) prepareWriteop(
 	}
 	w := &writeop{
 		opcode:    opcode,
-		dmap:      name,
+		dmap:      table,
 		key:       key,
 		value:     val,
 		timestamp: time.Now().UnixNano(),
@@ -372,7 +411,7 @@ func (dm *DMap) Put(key string, value interface{}) error {
 	return dm.db.put(w)
 }
 
-// Put sets the value for the given key. It overwrites any previous value
+// PutIf sets the value for the given key. It overwrites any previous value
 // for that key and it's thread-safe. The key has to be string. value type
 // is arbitrary. It is safe to modify the contents of the arguments after
 // Put returns but not before.

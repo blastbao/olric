@@ -329,11 +329,15 @@ func (d *Discovery) Rejoin(peers []string) (int, error) {
 // GetMembers returns a full list of known alive nodes.
 //
 // 返回 ml 集群中所有节点，按照启动时间排序。
+//
+// 获取所有节点
+// 解析节点元数据，得到 Member<节点名,节点ID,启动时间>
+// 按照启动时间排序后返回
 func (d *Discovery) GetMembers() []Member {
 	var members []Member
-	nodes := d.memberlist.Members() // 获取所有节点
+	nodes := d.memberlist.Members()
 	for _, node := range nodes {
-		member, _ := d.DecodeNodeMeta(node.Meta) // 解析节点元数据
+		member, _ := d.DecodeNodeMeta(node.Meta)
 		members = append(members, member)
 	}
 	// sort members by birthdate
@@ -370,14 +374,15 @@ func (d *Discovery) FindMemberByID(id uint64) (Member, error) {
 }
 
 // GetCoordinator returns the oldest node in the memberlist.
+//
+// 返回 ml 集群中所有节点，按照启动时间排序
+// 启动时间最早的 node 为 coordinator
 func (d *Discovery) GetCoordinator() Member {
-	// 返回 ml 集群中所有节点，按照启动时间排序
 	members := d.GetMembers()
 	if len(members) == 0 {
 		d.log.V(1).Printf("[ERROR] There is no member in memberlist")
 		return Member{}
 	}
-	// 启动时间最早的 node 为 coordinator
 	return members[0]
 }
 

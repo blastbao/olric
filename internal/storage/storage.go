@@ -387,12 +387,13 @@ func (s *Storage) Range(f func(hkey uint64, vdata *VData) bool) {
 }
 
 // MatchOnKey calls a regular expression on keys and provides an iterator.
+//
+// 使用正则表达式 expr 把匹配的 <key, value> 回调给 f()
 func (s *Storage) MatchOnKey(expr string, f func(hkey uint64, vdata *VData) bool) error {
 	if len(s.tables) == 0 {
 		panic("tables cannot be empty")
 	}
 
-	// 正则表达式
 	reg, err := regexp.Compile(expr)
 	if err != nil {
 		return err
