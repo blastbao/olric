@@ -66,6 +66,7 @@ func (s *stream) readFromStream(bufCh chan<- protocol.EncodeDecoder) error {
 
 		var msg protocol.EncodeDecoder
 		if header.Magic == protocol.MagicStreamReq {
+			// [重要] 这里把 s.conn 赛到 msg 中了
 			msg = protocol.NewStreamMessageFromRequest(buf)
 			msg.(*protocol.StreamMessage).SetConn(s.conn)
 		} else if header.Magic == protocol.MagicDMapReq {
@@ -142,13 +143,14 @@ func (s *stream) writeLoop() error {
 	}
 }
 
+// 记录从 stream 上接收消息的最新时间戳
 func (s *stream) setPingReceivedAt() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	s.pingReceivedAt = time.Now().UnixNano()
 }
 
+// 监测流连接是否存活：每秒钟检查最近 5 秒是否在 stream 上接收到了 ping 信号，若无则认为 stream 已断开。
 func (db *Olric) checkStreamAliveness(s *stream, streamID uint64) {
 	defer db.wg.Done()
 
@@ -175,12 +177,14 @@ loop:
 	}
 }
 
+// 注册一个 stream ：
+//   - 启动活跃监听协程：超过 5s 没有收到消息就认为其断开，清理资源；
+//   - 启动写协程：首先返回一个 `StreamCreated` 消息给客户端，然后监听 s.write 管道的消息并写入连接（目前看只在 topic 发布消息时会用到）
+//   - 启动读协程：将读到的消息投递到 s.read 管道（目前看有用到 stream 上发来的自定义消息，只是读取了 Ping 来更新活跃状态，并返回了 Pong）
 func (db *Olric) createStreamOperation(w, r protocol.EncodeDecoder) {
-	req := r.(*protocol.StreamMessage)
-
-	streamID := rand.Uint64()
 	ctx, cancel := context.WithCancel(context.Background())
-	db.streams.mu.Lock()
+	req := r.(*protocol.StreamMessage)
+	req.SetCancelFunc(cancel) // this cancel function will be called by the server when the underlying socket is gone.
 	s := &stream{
 		conn:   req.Conn(),
 		read:   make(chan protocol.EncodeDecoder, 1),
@@ -188,8 +192,9 @@ func (db *Olric) createStreamOperation(w, r protocol.EncodeDecoder) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	// this cancel function will be called by the server when the underlying socket is gone.
-	req.SetCancelFunc(s.cancel)
+
+	streamID := rand.Uint64()
+	db.streams.mu.Lock()
 	db.streams.m[streamID] = s
 	db.streams.mu.Unlock()
 
@@ -212,11 +217,9 @@ func (db *Olric) createStreamOperation(w, r protocol.EncodeDecoder) {
 	s.errGr.Go(func() error {
 		return s.writeLoop()
 	})
-
 	s.errGr.Go(func() error {
 		return s.readLoop()
 	})
-
 loop:
 	for {
 		select {

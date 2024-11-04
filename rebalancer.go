@@ -95,6 +95,11 @@ func (db *Olric) selectVersionForMerge(dm *dmap, hkey uint64, vdata *storage.VDa
 	return versions[0].data, nil
 }
 
+// 使用 storage.Import 将传入的 data.Payload 转换为可操作的存储结构 str
+// 检查 DMap 是否存在，如果不存在，则调用 db.createDMap 创建一个新的 DMap
+// 获取 DMap 的锁，以确保在合并过程中没有其他操作对其进行修改
+// 如果 DMap 有缓存和访问日志，则合并传入数据的访问日志，仅在当前日志中不存在该键时才进行合并。
+// 合并 DMap 数据: 遍历传入数据中的每个键值对，调用 db.selectVersionForMerge 选择合适的版本进行合并。
 func (db *Olric) mergeDMaps(part *partition, data *dmapbox) error {
 	str, err := storage.Import(data.Payload)
 	if err != nil {
@@ -327,6 +332,7 @@ func (db *Olric) checkOwnership(part *partition) bool {
 	return false
 }
 
+// 使用 storage.Import 将传入的 data.Payload 转换为可操作的存储结构 str
 func (db *Olric) moveDMapOperation(w, r protocol.EncodeDecoder) {
 	if err := db.checkOperationStatus(); err != nil {
 		db.errorResponse(w, err)

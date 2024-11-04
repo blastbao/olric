@@ -49,9 +49,9 @@ type DTopicMessage struct {
 
 // DTopic implements a distributed topic to deliver messages between clients and Olric nodes. You should know that:
 //
-//  * Communication between parties is one-to-many (fan-out).
-//  * All data is in-memory, and the published messages are not stored in the cluster.
-//  * Fire&Forget: message delivery is not guaranteed.
+//   - Communication between parties is one-to-many (fan-out).
+//   - All data is in-memory, and the published messages are not stored in the cluster.
+//   - Fire&Forget: message delivery is not guaranteed.
 type DTopic struct {
 	name        string
 	flag        int16
@@ -144,23 +144,25 @@ func (dt *dtopic) removeListener(topic string, listenerID uint64) error {
 
 // dispatch sends a received message to all registered listeners. It doesn't store
 // any message. It just dispatch the message.
+//
+// 将接收到的消息发送给所有注册的监听器（listeners）。
 func (dt *dtopic) dispatch(topic string, msg *DTopicMessage) error {
 	dt.topics.mtx.RLock()
 	defer dt.topics.mtx.RUnlock()
 
-	l, ok := dt.topics.m[topic]
+	ls, ok := dt.topics.m[topic]
 	if !ok {
 		// there is no listener for this topic on this node.
 		return fmt.Errorf("topic not found: %s: %w", topic, ErrInvalidArgument)
 	}
 
 	var wg sync.WaitGroup
-	if l.concurrency == 0 {
+	if ls.concurrency == 0 {
 		// the number of logical CPUs usable by the current process.
-		l.concurrency = runtime.NumCPU()
+		ls.concurrency = runtime.NumCPU()
 	}
-	sem := semaphore.NewWeighted(int64(l.concurrency))
-	for _, ll := range l.m {
+	sem := semaphore.NewWeighted(int64(ls.concurrency))
+	for _, ll := range ls.m {
 		if err := sem.Acquire(dt.ctx, 1); err != nil {
 			return err
 		}
@@ -185,12 +187,13 @@ func (dt *dtopic) destroy(topic string) {
 
 // NewDTopic returns a new distributed topic instance.
 // Parameters:
-//   * name: DTopic name.
-//   * concurrency: Maximum number of concurrently processing DTopic messages.
-//   * flag: Any flag to control DTopic behaviour.
+//   - name: DTopic name.
+//   - concurrency: Maximum number of concurrently processing DTopic messages.
+//   - flag: Any flag to control DTopic behaviour.
+//
 // Flags for delivery options:
-//   * UnorderedDelivery: Messages are delivered in random order. It's good to distribute independent events in a distributed system.
-//   * OrderedDelivery: Messages are delivered in order. Not implemented yet.
+//   - UnorderedDelivery: Messages are delivered in random order. It's good to distribute independent events in a distributed system.
+//   - OrderedDelivery: Messages are delivered in order. Not implemented yet.
 func (db *Olric) NewDTopic(name string, concurrency int, flag int16) (*DTopic, error) {
 	if flag&UnorderedDelivery == 0 && flag&OrderedDelivery == 0 {
 		return nil, fmt.Errorf("invalid delivery mode: %w", ErrInvalidArgument)
@@ -265,6 +268,7 @@ func (db *Olric) publishDTopicMessageToAddr(member discovery.Member, topic strin
 	return nil
 }
 
+// 将消息发布到指定的主题（topic）上：向每个集群成员调用 publishDTopicMessageToAddr 发送消息。
 func (db *Olric) publishDTopicMessage(topic string, msg *DTopicMessage) error {
 	db.members.mtx.RLock()
 	defer db.members.mtx.RUnlock()
@@ -296,27 +300,30 @@ func (db *Olric) publishDTopicMessage(topic string, msg *DTopicMessage) error {
 	return g.Wait()
 }
 
+// 客户端调用 exDTopicAddListenerOperation 的流程是：
+// 1. 建立 tcp 连接，发送 OpCreateStream 消息创建流，然后同步等待 reply ，reply 中包含 stream_id ；
+// 2. 建立 stream 流成功后，发送 OpDTopicAddListener 消息，将 stream 和 topic 绑定，后续 topic 上的 msg 会自动同步到 steam ；
 func (db *Olric) exDTopicAddListenerOperation(w, r protocol.EncodeDecoder) {
 	req := r.(*protocol.DTopicMessage)
 	name := req.DTopic()
 	streamID := req.Extra().(protocol.DTopicAddListenerExtra).StreamID
 	db.streams.mu.RLock()
-	str, ok := db.streams.m[streamID]
+	stm, ok := db.streams.m[streamID]
 	db.streams.mu.RUnlock()
 	if !ok {
 		err := fmt.Errorf("%w: StreamID could not be found", ErrInvalidArgument)
 		db.errorResponse(w, err)
 		return
 	}
-
 	// Local listener
 	listenerID := req.Extra().(protocol.DTopicAddListenerExtra).ListenerID
 
+	// 如果数据库关闭、请求流关闭，就移除 listener
 	db.wg.Add(1)
 	go func() {
 		defer db.wg.Done()
 		select {
-		case <-str.ctx.Done():
+		case <-stm.ctx.Done():
 		case <-db.ctx.Done():
 		}
 		err := db.dtopic.removeListener(name, listenerID)
@@ -326,6 +333,7 @@ func (db *Olric) exDTopicAddListenerOperation(w, r protocol.EncodeDecoder) {
 		db.log.V(4).Printf("[INFO] ListenerID: %d has been removed", listenerID)
 	}()
 
+	// 消息回调：每从 topic 收到一条消息 msg ，就回调此函数，将 msg 序列化后写入到 stream 中
 	f := func(msg DTopicMessage) {
 		db.streams.mu.RLock()
 		s, ok := db.streams.m[streamID]
@@ -338,26 +346,31 @@ func (db *Olric) exDTopicAddListenerOperation(w, r protocol.EncodeDecoder) {
 			}
 			return
 		}
+
 		value, err := msgpack.Marshal(msg)
 		if err != nil {
 			db.log.V(4).Printf("[ERROR] Failed to serialize DTopicMessage: %v", err)
 			return
 		}
+
 		m := protocol.NewDMapMessage(protocol.OpStreamMessage)
 		m.SetDMap(name)
 		m.SetValue(value)
 		m.SetExtra(protocol.StreamMessageExtra{
 			ListenerID: listenerID,
 		})
+
 		s.write <- m
 	}
+
 	// set concurrency parameter as 0. the registered listener will only make network i/o. NumCPU is good for this.
+	// 注册 listener
 	err := db.dtopic.addRemoteListener(listenerID, name, 0, f)
 	if err != nil {
-		db.errorResponse(w, err)
+		db.errorResponse(w, err) // 注册失败
 		return
 	}
-	w.SetStatus(protocol.StatusOK)
+	w.SetStatus(protocol.StatusOK) // 注册成功
 }
 
 func (db *Olric) exDTopicPublishOperation(w, r protocol.EncodeDecoder) {

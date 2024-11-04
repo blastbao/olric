@@ -1,7 +1,3 @@
-
-
-
-
 cassandra 中，删除数据如何确保分布式一致？
 
 1. 一致性级别（Consistency Level）
@@ -14,10 +10,14 @@ Cassandra 使用一致性级别来控制在执行写操作（包括删除）时�
 删除操作会遵循指定的一致性级别来决定有多少个节点需要确认删除才算成功，这有助于确保删除在指定范围内达到一致性。
 
 2. Tombstones 机制
-当 Cassandra 删除数据时，它不会立即从磁盘中移除，而是用 Tombstones 标记该数据。
+在 Cassandra 中，Tombstone Compaction 是一种专门处理标记为已删除（即“Tombstone”）的数据的压缩机制，以释放存储空间和提高查询性能。
+Tombstone 是 Cassandra 中用于标记数据删除的特殊记录。
+当数据被删除时，Cassandra 并不会立即从磁盘中移除数据，而是用一个 Tombstone 记录来标记该数据为已删除。
 这些 Tombstones 会像普通数据一样在集群中传播，以确保所有副本都知道该数据已被删除。
-在后台，Cassandra 定期执行压缩（compaction）操作。在压缩过程中，系统会根据 Tombstones 的存在时间（TTL）来清理过期的 Tombstones 和实际数据。
-如果 Tombstones 过多，可能导致查询性能下降。因此，Cassandra 提供了配置参数来管理 Tombstones 的生成和清理。
+这些 Tombstone 记录会在指定的 gc_grace_seconds（垃圾回收保留时间）之后才被清理，
+以确保在集群中发生暂时的节点故障或网络分区时，删除操作仍然能够被传播到所有副本。
+在合并 SSTable 文件时，Cassandra 会检查 Tombstone 的时间戳。
+如果 Tombstone 的存在时间超过 gc_grace_seconds，且所有相关副本都确保接收了删除信息，那么该 Tombstone 及其指向的已删除数据将被移除。
 
 3. 写操作的时间戳（Timestamp）
 Cassandra 使用时间戳来确定数据变更的顺序。删除操作在数据库中有自己的时间戳，这样系统可以识别删除操作是否比其他写入操作更新。
@@ -33,7 +33,6 @@ Cassandra 使用 反熵（Anti-Entropy）机制 和 读修复（Read Repair） �
 Hinted Handoff 是 Cassandra 处理节点临时不可用的机制。
 当一个节点在写入时不可用，其他节点会记录提示（Hint），并在该节点恢复时将这些提示发送给它。
 这样可以确保删除操作在临时网络分区或节点故障后传播到所有副本。
-
 
 Cassandra 中的 Hinted Handoff 是什么？
 
