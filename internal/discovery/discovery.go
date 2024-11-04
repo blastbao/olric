@@ -387,6 +387,14 @@ func (d *Discovery) GetCoordinator() Member {
 }
 
 // IsCoordinator returns true if the caller is the coordinator node.
+//
+// 集群中如何就 Coordinator 达成一致？
+//
+// 每个节点的 member 列表是通过 gossip 来更新的，节点认为其中启动最早的为 coordinator;
+// 每个节点的 member 列表是不同的，所以各自认为的 coordinator 不同；
+// 集群在收到控制消息时，检查来源 coordinator 是否和字节 member list 中一致，不一致则忽略；
+// 如果是当前节点滞后，那么等其 member list 更新后，再接收当前 coordinator 的消息；
+// 如果是 coordinator 滞后，那么在其 member list 更新后，它发现它已经不是最新 coordinator ，会自动退出角色，不再发布控制消息。
 func (d *Discovery) IsCoordinator() bool {
 	return d.GetCoordinator().ID == d.host.ID
 }
