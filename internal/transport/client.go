@@ -128,11 +128,13 @@ func (c *Client) ClosePool(addr string) {
 
 // RequestTo initiates a request-response cycle to given host.
 func (c *Client) RequestTo(addr string, req protocol.EncodeDecoder) (protocol.EncodeDecoder, error) {
+	// 获取 addr 绑定的连接池
 	cpool, err := c.getPool(addr)
 	if err != nil {
 		return nil, err
 	}
 
+	// 获取连接
 	conn, err := cpool.Get()
 	if err != nil {
 		return nil, err
@@ -156,31 +158,37 @@ func (c *Client) RequestTo(addr string, req protocol.EncodeDecoder) (protocol.En
 		}
 	}()
 
+	// 获取 buffer
 	buf := bufferPool.Get()
 	defer bufferPool.Put(buf)
-	req.SetBuffer(buf)
 
+	// 把请求序列化存入 buffer
+	req.SetBuffer(buf)
 	err = req.Encode()
 	if err != nil {
 		deadConn = true
 		return nil, err
 	}
 
+	// 把 buffer 写入到 conn
 	_, err = req.Buffer().WriteTo(conn)
 	if err != nil {
 		return nil, err
 	}
 
 	// Await for the response
+	// 发送完毕后，buffer 中内容不再需要，重置 buffer ，然后从 conn 中读取请求到 buffer 中
 	buf.Reset()
 	_, err = protocol.ReadMessage(conn, buf)
 	// Response is a shortcut to create a response message for the request.
+	// 解析请求体，解析完毕后 buffer 不再需要，交由 defer 回收
 	resp := req.Response(buf)
 	err = resp.Decode()
 	if err != nil {
 		deadConn = true
 		return nil, err
 	}
+	// 返回
 	return resp, err
 }
 

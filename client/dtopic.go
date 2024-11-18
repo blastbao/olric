@@ -38,12 +38,13 @@ type DTopic struct {
 
 // NewDTopic returns a new distributed topic instance.
 // Parameters:
-//   * name: DTopic name.
-//   * concurrency: Maximum number of concurrently processing DTopic messages.
-//   * flag: Any flag to control DTopic behaviour.
+//   - name: DTopic name.
+//   - concurrency: Maximum number of concurrently processing DTopic messages.
+//   - flag: Any flag to control DTopic behaviour.
+//
 // Flags for delivery options:
-//   * UnorderedDelivery: Messages are delivered in random order. It's good to distribute independent events in a distributed system.
-//   * OrderedDelivery: Messages are delivered in order. Not implemented yet.
+//   - UnorderedDelivery: Messages are delivered in random order. It's good to distribute independent events in a distributed system.
+//   - OrderedDelivery: Messages are delivered in order. Not implemented yet.
 func (c *Client) NewDTopic(name string, concurrency int, flag int16) (*DTopic, error) {
 	if flag&olric.UnorderedDelivery == 0 && flag&olric.OrderedDelivery == 0 {
 		return nil, fmt.Errorf("invalid delivery mode: %w", olric.ErrInvalidArgument)
@@ -62,13 +63,16 @@ func (c *Client) NewDTopic(name string, concurrency int, flag int16) (*DTopic, e
 
 // Publish sends a message to the given topic. It accepts any serializable type as message.
 func (dt *DTopic) Publish(msg interface{}) error {
+	// 消息序列化
 	value, err := dt.serializer.Marshal(msg)
 	if err != nil {
 		return err
 	}
+	// 构造请求
 	req := protocol.NewDTopicMessage(protocol.OpDTopicPublish)
 	req.SetDTopic(dt.name)
 	req.SetValue(value)
+	// 轮训下一个 node 发送 req
 	resp, err := dt.client.Request(req)
 	if err != nil {
 		return err
